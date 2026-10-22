@@ -79,6 +79,29 @@ async function initialize(url: string): Promise<string> {
   return sessionId!;
 }
 
+/** Drops the next armed `response.end` so the socket closes before the body is finished. */
+function installDroppedEnd(): { arm: () => void; restore: () => void } {
+  // The replacement has to call the real end for every response except the one this test drops.
+  // eslint-disable-next-line @typescript-eslint/unbound-method
+  const originalEnd = ServerResponse.prototype.end;
+  let armed = false;
+  ServerResponse.prototype.end = function (this: ServerResponse, ...args: never[]) {
+    if (!armed) return originalEnd.apply(this, args as unknown as [chunk: unknown, encoding: BufferEncoding, cb?: () => void]);
+    armed = false;
+    this.socket?.destroy();
+    this.req?.socket?.destroy();
+    return this;
+  } as typeof originalEnd;
+  return {
+    arm: () => {
+      armed = true;
+    },
+    restore: () => {
+      ServerResponse.prototype.end = originalEnd;
+    },
+  };
+}
+
 function bareServer(): McpServer {
   return new McpServer({ name: 'openrecord-test', version: '0.0.0' });
 }
@@ -345,17 +368,7 @@ describe('startHttpServer', () => {
     const work = new Promise<CallToolResult>((resolve) => {
       release = resolve;
     });
-    // The replacement has to call the real end for every response except the one this test drops.
-    // eslint-disable-next-line @typescript-eslint/unbound-method
-    const originalEnd = ServerResponse.prototype.end;
-    let armed = false;
-    ServerResponse.prototype.end = function (this: ServerResponse, ...args: never[]) {
-      if (!armed) return originalEnd.apply(this, args as unknown as [chunk: unknown, encoding: BufferEncoding, cb?: () => void]);
-      armed = false;
-      this.socket?.destroy();
-      this.req?.socket?.destroy();
-      return this;
-    } as typeof originalEnd;
+    const dropped = installDroppedEnd();
     try {
       listening = await startHttpServer({
         token: TOKEN,
@@ -392,17 +405,27 @@ describe('startHttpServer', () => {
         if (Date.now() - started > 1000) throw new Error('tool call never started waiting');
         await sleep(5);
       }
-      armed = true;
+      dropped.arm();
       release({ content: [{ type: 'text', text: 'sent' }] });
       await first.then((res) => res.text()).catch(() => undefined);
       expect(runs).toBe(1);
 
-      const again = await call(3);
+      dropped.arm();
+      const joined = fetch(url, {
+        method: 'POST',
+        headers,
+        signal: AbortSignal.timeout(800),
+        body: JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'slow_read', arguments: {} } }),
+      });
+      await joined.then((res) => res.text()).catch(() => undefined);
+      expect(runs).toBe(1);
+
+      const again = await call(4);
       expect(again.status).toBe(200);
       expect(toolText(await readRpc(again))).toBe('sent');
       expect(runs).toBe(1);
     } finally {
-      ServerResponse.prototype.end = originalEnd;
+      dropped.restore();
     }
   });
 
@@ -453,6 +476,72 @@ describe('startHttpServer', () => {
     expect(toolText(await readRpc(await first))).toBe('once');
     expect(toolText(await readRpc(await second))).toBe('once');
     expect(runs).toBe(1);
+  });
+
+  it('keeps a collected result when the collection response is destroyed before it ends', async () => {
+    let release: (result: CallToolResult) => void = () => {};
+    const work = new Promise<CallToolResult>((resolve) => {
+      release = resolve;
+    });
+    const dropped = installDroppedEnd();
+    try {
+      listening = await startHttpServer({
+        token: TOKEN,
+        port: 0,
+        createServer: () => {
+          const mcp = new McpServer({ name: 'openrecord-test', version: '0.0.0' });
+          mcp.registerTool('slow_read', { description: 'test', inputSchema: {} }, () => runGuarded('slow_read', {}, () => work, 15));
+          mcp.registerTool(
+            'check_pending_call',
+            { description: 'test', inputSchema: { id: z.string().optional(), wait: z.boolean().optional() } },
+            (args) =>
+              checkPendingCall({
+                ...(args.id !== undefined ? { id: args.id } : {}),
+                ...(args.wait !== undefined ? { wait: args.wait } : {}),
+              }),
+          );
+          return mcp;
+        },
+      });
+      const url = `http://127.0.0.1:${listening.port}/mcp`;
+      const sessionId = await initialize(url);
+      const headers = { ...mcpHeaders, 'mcp-session-id': sessionId, 'mcp-protocol-version': '2025-06-18' };
+      const call = (id: number, name: string, args: Record<string, unknown>) =>
+        fetch(url, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name, arguments: args } }),
+        });
+
+      const parked = await call(2, 'slow_read', {});
+      const parkedId = /id "([^"]+)"/.exec(toolText(await readRpc(parked)))?.[1];
+      expect(parkedId).toBeTruthy();
+
+      const collect = fetch(url, {
+        method: 'POST',
+        headers,
+        signal: AbortSignal.timeout(800),
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 3,
+          method: 'tools/call',
+          params: { name: 'check_pending_call', arguments: { id: parkedId } },
+        }),
+      });
+      const started = Date.now();
+      while (collectionWaitsInFlight() < 1) {
+        if (Date.now() - started > 1000) throw new Error('collection never started waiting');
+        await sleep(5);
+      }
+      dropped.arm();
+      release({ content: [{ type: 'text', text: 'sent' }] });
+      await collect.then((res) => res.text()).catch(() => undefined);
+
+      const again = await call(4, 'check_pending_call', { id: parkedId, wait: false });
+      expect(toolText(await readRpc(again))).toBe('sent');
+    } finally {
+      dropped.restore();
+    }
   });
 
   it('keeps a parked result when the waiting collection is disconnected', async () => {

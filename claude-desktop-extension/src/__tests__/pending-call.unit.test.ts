@@ -168,6 +168,18 @@ describe('checkPendingCall', () => {
     expect(unsettledCallOnAccount(ACCOUNT.account)).toBeUndefined();
   });
 
+  it('discards a result abandoned while its collection is waiting', async () => {
+    const d = deferred();
+    const id = idOf(await runGuarded('get_billing', ACCOUNT, d.fn, 5));
+    const waiting = checkPendingCall({ id }, 5_000);
+    await tick();
+    await checkPendingCall({ id, abandon: true });
+    d.resolve(ok('bills'));
+    const done = text(await waiting);
+    expect(done).toContain('its result was discarded');
+    expect(done).not.toContain('bills');
+  });
+
   it('releases the chart lock at the cap even when the scrape never settles', async () => {
     // A scrape that never resolves used to hold switch_proxy_target for the
     // life of the process, with check_pending_call calling the same id gone.

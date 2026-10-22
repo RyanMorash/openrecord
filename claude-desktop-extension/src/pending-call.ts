@@ -421,7 +421,6 @@ export async function checkPendingCall(
   // still reading the chart, so waiting here is how they see the account come
   // free — which is exactly what switch_proxy_target's refusal tells them to
   // do. Short-circuiting here instead left that instruction unfollowable.
-  const discarded = p.abandoned === true;
   const linked = linkSignals(signal, lostResponse.getStore());
   const stop = linked.signal;
 
@@ -447,7 +446,9 @@ export async function checkPendingCall(
       return stillRunning(`${p.tool} (id "${id}") is still running (${elapsed(p.startedAt, Date.now())} so far, of at most 10 minutes). ${how}`, id);
     }
     if (result) {
-      if (discarded) return discardFinished(p);
+      // Read after the wait. Abandon can land while this collection is blocked,
+      // and the flag from before the wait would still hand over the payload.
+      if (p.abandoned) return discardFinished(p);
       releaseIfWritten(p, 'collected');
       return result;
     }
@@ -455,7 +456,7 @@ export async function checkPendingCall(
       forget(p, 'given up on after running 10 minutes');
       return text(`Gave up on ${p.tool} after 10 minutes. Its result is discarded and this account is no longer held. ${ABANDON_MEANS}`, true);
     }
-    const how = discarded
+    const how = p.abandoned
       ? `Its result will be discarded, because it was abandoned. Call ${CHECK_TOOL} again to wait for the account to come free.`
       : `Call ${CHECK_TOOL} again to keep waiting, or with abandon: true to stop waiting. ${ABANDON_MEANS}`;
     return stillRunning(`${p.tool} (id "${id}") is still running (${elapsed(p.startedAt, Date.now())} so far, of at most 10 minutes). ${how}`, id);

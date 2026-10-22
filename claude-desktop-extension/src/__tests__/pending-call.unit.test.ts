@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, setSystemTime } from 'bun:
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { CAPABILITIES } from '../../../shared/capabilities';
-import { CHECK_TOOL, MAX_RUN_MS, checkPendingCall, resetPendingCalls, runGuarded, unsettledCallOnAccount, useDesktopParkDeadline, useHttpParkDeadline } from '../pending-call';
+import { CHECK_TOOL, MAX_RUN_MS, checkPendingCall, resetPendingCalls, runGuarded, unsettledCallOnAccount, useDesktopParkDeadline, useHttpParkDeadline, withLostResponse } from '../pending-call';
 
 const ok = (text: string): CallToolResult => ({ content: [{ type: 'text', text }] });
 const text = (r: CallToolResult): string => (r.content[0] as { text: string }).text;
@@ -223,6 +223,70 @@ describe('http park deadline', () => {
     await tick();
     expect(text(await waiting)).toContain('is still running');
     expect(await checkPendingCall({ id, wait: false })).toEqual(ok('profile'));
+  });
+
+  it('runs an identical in-flight HTTP call once and shares the result', async () => {
+    const d = deferred();
+    let runs = 0;
+    const run = (): Promise<CallToolResult> => {
+      runs += 1;
+      return d.fn();
+    };
+    const owner = withLostResponse(new AbortController().signal, () => runGuarded('send_message', ACCOUNT, run, 5_000));
+    await tick();
+    const joiner = withLostResponse(new AbortController().signal, () => runGuarded('send_message', ACCOUNT, run, 5_000));
+    await tick();
+    expect(runs).toBe(1);
+    d.resolve(ok('once'));
+    expect(await owner).toEqual(ok('once'));
+    expect(await joiner).toEqual(ok('once'));
+    expect(await withLostResponse(new AbortController().signal, () => runGuarded('send_message', ACCOUNT, () => ok('fresh'), 50))).toEqual(ok('fresh'));
+    expect(runs).toBe(1);
+  });
+
+  it('leaves the result parked when both HTTP callers disconnect', async () => {
+    const d = deferred();
+    let runs = 0;
+    const run = (): Promise<CallToolResult> => {
+      runs += 1;
+      return d.fn();
+    };
+    const ownerStop = new AbortController();
+    const joinerStop = new AbortController();
+    const owner = withLostResponse(ownerStop.signal, () => runGuarded('send_message', ACCOUNT, run, 5_000));
+    await tick();
+    const joiner = withLostResponse(joinerStop.signal, () => runGuarded('send_message', ACCOUNT, run, 5_000));
+    await tick();
+    ownerStop.abort();
+    joinerStop.abort();
+    d.resolve(ok('sent'));
+    await tick();
+    expect(runs).toBe(1);
+    const ownerNote = await owner;
+    const joinerNote = await joiner;
+    expect(text(ownerNote)).toContain('is still running');
+    expect(idOf(joinerNote)).toBe(idOf(ownerNote));
+    expect(await checkPendingCall({ id: idOf(ownerNote), wait: false })).toEqual(ok('sent'));
+  });
+
+  it('does not park again after a joined caller already received the result', async () => {
+    const d = deferred();
+    let runs = 0;
+    const run = (): Promise<CallToolResult> => {
+      runs += 1;
+      return d.fn();
+    };
+    const ownerStop = new AbortController();
+    const owner = withLostResponse(ownerStop.signal, () => runGuarded('send_message', ACCOUNT, run, 5_000));
+    await tick();
+    const joiner = withLostResponse(new AbortController().signal, () => runGuarded('send_message', ACCOUNT, run, 5_000));
+    await tick();
+    ownerStop.abort();
+    d.resolve(ok('sent'));
+    expect(await joiner).toEqual(ok('sent'));
+    await owner;
+    expect(runs).toBe(1);
+    expect(await withLostResponse(new AbortController().signal, () => runGuarded('send_message', ACCOUNT, () => ok('fresh'), 50))).toEqual(ok('fresh'));
   });
 
   it('parks a finished call when the original request is aborted', async () => {

@@ -5,13 +5,13 @@
  * under test registers nothing, so a successful initialize only proves the
  * listener, the bearer check, and the session map.
  */
-import { afterEach, describe, expect, it } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import { request as httpRequest } from 'node:http';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import { startHttpServer, type HttpServer } from '../http';
-import { checkPendingCall, collectionWaitsInFlight, guardedWaitsInFlight, runGuarded } from '../pending-call';
+import { checkPendingCall, collectionWaitsInFlight, guardedWaitsInFlight, resetPendingCalls, runGuarded } from '../pending-call';
 
 const TOKEN = 'test-token';
 function sleep(ms: number): Promise<void> {
@@ -92,9 +92,14 @@ async function readRpc(res: Response): Promise<unknown> {
 describe('startHttpServer', () => {
   let listening: HttpServer | undefined;
 
+  beforeEach(() => {
+    resetPendingCalls();
+  });
+
   afterEach(async () => {
     await listening?.close();
     listening = undefined;
+    resetPendingCalls();
   });
 
   it('refuses to listen without a token', async () => {
@@ -296,6 +301,86 @@ describe('startHttpServer', () => {
 
     const next = await initialize(url);
     expect(next).toBeTruthy();
+  });
+
+  it('returns a finished tool result on a connection that stays open', async () => {
+    listening = await startHttpServer({
+      token: TOKEN,
+      port: 0,
+      createServer: () => {
+        const mcp = new McpServer({ name: 'openrecord-test', version: '0.0.0' });
+        mcp.registerTool('slow_read', { description: 'test', inputSchema: {} }, () =>
+          runGuarded('slow_read', {}, () => ({ content: [{ type: 'text', text: 'ready' }] }), 5_000),
+        );
+        return mcp;
+      },
+    });
+    const url = `http://127.0.0.1:${listening.port}/mcp`;
+    const sessionId = await initialize(url);
+    const headers = { ...mcpHeaders, 'mcp-session-id': sessionId, 'mcp-protocol-version': '2025-06-18' };
+    const call = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'slow_read', arguments: {} } }),
+    });
+    expect(call.status).toBe(200);
+    expect(toolText(await readRpc(call))).toBe('ready');
+
+    const again = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'slow_read', arguments: {} } }),
+    });
+    expect(toolText(await readRpc(again))).toBe('ready');
+  });
+
+  it('runs an identical in-flight HTTP call once', async () => {
+    let runs = 0;
+    let release: (result: CallToolResult) => void = () => {};
+    const work = new Promise<CallToolResult>((resolve) => {
+      release = resolve;
+    });
+    listening = await startHttpServer({
+      token: TOKEN,
+      port: 0,
+      createServer: () => {
+        const mcp = new McpServer({ name: 'openrecord-test', version: '0.0.0' });
+        mcp.registerTool('slow_read', { description: 'test', inputSchema: {} }, () =>
+          runGuarded('slow_read', {}, () => {
+            runs += 1;
+            return work;
+          }, 5_000),
+        );
+        return mcp;
+      },
+    });
+    const url = `http://127.0.0.1:${listening.port}/mcp`;
+    const sessionId = await initialize(url);
+    const headers = { ...mcpHeaders, 'mcp-session-id': sessionId, 'mcp-protocol-version': '2025-06-18' };
+    const call = (id: number) =>
+      fetch(url, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name: 'slow_read', arguments: {} } }),
+      });
+
+    const first = call(2);
+    const started = Date.now();
+    while (guardedWaitsInFlight() < 1) {
+      if (Date.now() - started > 1000) throw new Error('first call never started');
+      await sleep(5);
+    }
+    expect(runs).toBe(1);
+    const second = call(3);
+    while (guardedWaitsInFlight() < 2) {
+      if (Date.now() - started > 1000) throw new Error('second call never joined');
+      await sleep(5);
+    }
+    expect(runs).toBe(1);
+    release({ content: [{ type: 'text', text: 'once' }] });
+    expect(toolText(await readRpc(await first))).toBe('once');
+    expect(toolText(await readRpc(await second))).toBe('once');
+    expect(runs).toBe(1);
   });
 
   it('keeps a parked result when the waiting collection is disconnected', async () => {

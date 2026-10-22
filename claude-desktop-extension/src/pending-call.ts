@@ -21,12 +21,15 @@
  * Desktop is unchanged.
  *
  * Calls are not serialized — the same log shows Claude Desktop issuing a
- * second call 5.5 s after an unanswered first — so several may park. A
- * parked call refuses one thing: a repeat of itself with the same arguments,
- * the retry that would send a message twice. switch_proxy_target also
- * refuses while a parked read on the account is still running
- * (`unsettledCallOnAccount`): MyChart's active patient is server-side state,
- * and switching under a running read hands it the wrong chart.
+ * second call 5.5 s after an unanswered first — so several may park. On
+ * stdio a parked call refuses a repeat of itself with the same arguments,
+ * the retry that would send a message twice. HTTP reserves that key before
+ * its first await, and a second request joins the call already in flight,
+ * because a proxy retry can start while the first request is still open.
+ * switch_proxy_target also refuses while a parked read on the account is
+ * still running (`unsettledCallOnAccount`): MyChart's active patient is
+ * server-side state, and switching under a running read hands it the wrong
+ * chart.
  *
  * Abandoning a call only stops waiting for it. Nothing in the scraper core
  * takes an abort signal, so the work runs on and a write already sent lands.
@@ -80,6 +83,8 @@ interface Parked {
   promise: Promise<CallToolResult>;
   result?: CallToolResult;
   settledAt?: number;
+  /** A connected caller already received this result. A disconnected owner must not park it again. */
+  delivered?: boolean;
   /** The caller stopped waiting, so the result is no longer theirs. The entry stays until the scrape settles, or the cap, so the proxy guard still sees it. */
   abandoned?: boolean;
 }
@@ -87,7 +92,7 @@ interface Parked {
 const parked = new Map<string, Parked>();
 /** Collections blocked inside the wait. The disconnect test waits until this is non-zero. */
 let waitingCollections = 0;
-/** Original tool calls blocked inside their first wait. The disconnect test waits until this is non-zero. */
+/** Tool calls and HTTP joiners blocked inside their wait. The disconnect test waits until this is non-zero. */
 let waitingGuards = 0;
 
 export function collectionWaitsInFlight(): number {
@@ -221,6 +226,37 @@ function listing(now: number): string {
   return all.length ? all.map((p) => describe(p, now)).join('; ') : 'nothing is pending';
 }
 
+function parkNote(tool: string, id: string): string {
+  return (
+    `${tool} (id "${id}") is still running after ${parkDeadlineLabel} and keeps running in the background for up ` +
+    `to 10 minutes. Call ${CHECK_TOOL} with that id to wait for and read its result. An identical retry joins ` +
+    'this same call instead of starting another, so a tool that sends something is not sent twice. Other tools are unaffected.'
+  );
+}
+
+/** Hand a parked result to a caller that is still connected, so a later retry does not run the tool again. */
+function deliverParked(entry: Parked): void {
+  entry.delivered = true;
+  if (parked.has(entry.id)) forget(entry, 'collected');
+}
+
+/** A second HTTP request for a call that is already running. One execution, shared result. */
+async function joinParked(entry: Parked, deadlineMs: number, signal?: AbortSignal): Promise<CallToolResult> {
+  const linked = linkSignals(signal, lostResponse.getStore());
+  const stop = linked.signal;
+  let result = entry.result;
+  waitingGuards += 1;
+  try {
+    if (result === undefined && !stop?.aborted) result = await settleWithin(entry.promise, deadlineMs, stop);
+  } finally {
+    waitingGuards -= 1;
+    linked.stop();
+  }
+  if (stop?.aborted || !result) return stillRunning(parkNote(entry.tool, entry.id), entry.id);
+  deliverParked(entry);
+  return result;
+}
+
 /** Run a tool's handler under the deadline. `deadlineMs` is the test seam. */
 export async function runGuarded(
   tool: string,
@@ -234,6 +270,10 @@ export async function runGuarded(
   const key = `${tool} ${canonical(args)}`;
   const same = [...parked.values()].find((p) => p.key === key && !p.abandoned);
   if (same) {
+    // HTTP retries join the call already in flight so a write cannot run twice.
+    // Stdio keeps the old behavior: a second call inside the deadline runs,
+    // and only a call that has already parked is refused.
+    if (lostResponse.getStore()) return joinParked(same, deadlineMs, signal);
     const state = same.settledAt === undefined ? `running (started ${elapsed(same.startedAt, now)} ago)` : 'finished, with its result unread';
     return text(`This exact call is already ${state}. Call ${CHECK_TOOL} with id "${same.id}" instead of running it again.`, true);
   }
@@ -241,6 +281,19 @@ export async function runGuarded(
   const promise = Promise.resolve()
     .then(fn)
     .catch((err: unknown) => text(`Error: ${(err as Error).message}`, true));
+  const account = typeof args.account === 'string' ? args.account.trim().toLowerCase() : null;
+  // Reserve the key before the first await. Two HTTP requests can otherwise
+  // both pass the check above and both run the tool.
+  const reserved: Parked | undefined = lostResponse.getStore()
+    ? { id: randomUUID(), tool, key, account, startedAt: now, promise }
+    : undefined;
+  if (reserved) {
+    parked.set(reserved.id, reserved);
+    void promise.then((r) => {
+      reserved.result = r;
+      reserved.settledAt = Date.now();
+    });
+  }
   const linked = linkSignals(signal, lostResponse.getStore());
   const stop = linked.signal;
   let result: CallToolResult | undefined;
@@ -253,9 +306,16 @@ export async function runGuarded(
   }
   // A disconnect during this wait must not take the direct return. The bytes
   // would go nowhere, the call would not be parked, and a retry could send twice.
-  if (result && !stop?.aborted) return result;
+  if (result && !stop?.aborted) {
+    if (reserved) deliverParked(reserved);
+    return result;
+  }
+  if (reserved?.delivered) return result ?? reserved.result ?? stillRunning(parkNote(tool, reserved.id), reserved.id);
+  if (reserved) {
+    if (!parked.has(reserved.id)) parked.set(reserved.id, reserved);
+    return stillRunning(parkNote(tool, reserved.id), reserved.id);
+  }
 
-  const account = typeof args.account === 'string' ? args.account.trim().toLowerCase() : null;
   const entry: Parked = { id: randomUUID(), tool, key, account, startedAt: now, promise };
   parked.set(entry.id, entry);
   void promise.then((r) => {

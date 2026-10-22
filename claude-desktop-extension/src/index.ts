@@ -100,9 +100,9 @@ const LONG_CALLS_HTTP =
   'drops before the note is sent, the call is still parked: list it with check_pending_call and no id. ' +
   'Collect the result with check_pending_call(id). A collection waits at most 1 minute and leaves a result that is not ' +
   'ready yet parked. If that collection\'s connection drops, the result stays parked under the same id, ' +
-  'including when the work finishes after the drop. Never repeat that call with the same ' +
-  'arguments while it is pending — it is already running and would be refused, and a tool that sends ' +
-  'something would send it twice. Other tools are unaffected, except switch_proxy_target on that ' +
+  'including when the work finishes after the drop. An identical retry while it is pending joins ' +
+  'that same call instead of starting another, so a tool that sends something is not sent twice. ' +
+  'Other tools are unaffected, except switch_proxy_target on that ' +
   'account, which waits for the read.';
 
 function createMcpServer(mode: 'stdio' | 'http'): McpServer {

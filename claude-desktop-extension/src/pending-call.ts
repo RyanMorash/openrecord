@@ -41,6 +41,8 @@ import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
 /** Set by the HTTP server for the request it is answering. A dropped response aborts it. Stdio never sets it. */
 const lostResponse = new AsyncLocalStorage<AbortSignal>();
+/** The HTTP reservation whose handler is running. It is already in `parked`, and is not a second call. */
+const executingCall = new AsyncLocalStorage<string>();
 
 export function withLostResponse<T>(signal: AbortSignal, fn: () => Promise<T>): Promise<T> {
   return lostResponse.run(signal, fn);
@@ -278,14 +280,16 @@ export async function runGuarded(
     return text(`This exact call is already ${state}. Call ${CHECK_TOOL} with id "${same.id}" instead of running it again.`, true);
   }
 
-  const promise = Promise.resolve()
-    .then(fn)
-    .catch((err: unknown) => text(`Error: ${(err as Error).message}`, true));
   const account = typeof args.account === 'string' ? args.account.trim().toLowerCase() : null;
   // Reserve the key before the first await. Two HTTP requests can otherwise
-  // both pass the check above and both run the tool.
-  const reserved: Parked | undefined = lostResponse.getStore()
-    ? { id: randomUUID(), tool, key, account, startedAt: now, promise }
+  // both pass the check above and both run the tool. The handler runs inside
+  // executingCall so a switch does not treat this reservation as another read.
+  const reservedId = lostResponse.getStore() ? randomUUID() : undefined;
+  const promise = Promise.resolve()
+    .then(() => (reservedId ? executingCall.run(reservedId, fn) : fn()))
+    .catch((err: unknown) => text(`Error: ${(err as Error).message}`, true));
+  const reserved: Parked | undefined = reservedId
+    ? { id: reservedId, tool, key, account, startedAt: now, promise }
     : undefined;
   if (reserved) {
     parked.set(reserved.id, reserved);
@@ -330,11 +334,12 @@ export async function runGuarded(
   );
 }
 
-/** The parked call still reading this account's chart, abandoned or not. */
+/** The parked call still reading this account's chart, abandoned or not. Skips the call asking. */
 export function unsettledCallOnAccount(account: string): { tool: string; id: string } | undefined {
   sweep(Date.now());
   const wanted = account.trim().toLowerCase();
-  return [...parked.values()].find((p) => p.settledAt === undefined && p.account === wanted);
+  const self = executingCall.getStore();
+  return [...parked.values()].find((p) => p.id !== self && p.settledAt === undefined && p.account === wanted);
 }
 
 /**

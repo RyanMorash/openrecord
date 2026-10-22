@@ -329,4 +329,29 @@ describe('registered through the server', () => {
     await tick();
     expect(await tools.get(CHECK_TOOL)!({ id })).toEqual(ok('bills'));
   });
+
+  it('an HTTP switch does not refuse its own reservation, and still waits for another read', async () => {
+    const { registerAllTools } = await import('../tools');
+    const tools = new Map<string, Handler>();
+    registerAllTools({
+      registerTool: (name: string, _config: unknown, handler: Handler) => {
+        tools.set(name, handler);
+      },
+    } as unknown as McpServer);
+
+    const alone = await withLostResponse(new AbortController().signal, () =>
+      tools.get('switch_proxy_target')!({ ...ACCOUNT, patient: 'bart' }),
+    );
+    expect(text(alone)).not.toContain('still reading');
+
+    const d = deferred();
+    const read = withLostResponse(new AbortController().signal, () => runGuarded('get_billing', ACCOUNT, d.fn, 5_000));
+    await tick();
+    const blocked = await withLostResponse(new AbortController().signal, () =>
+      tools.get('switch_proxy_target')!({ ...ACCOUNT, patient: 'bart' }),
+    );
+    expect(text(blocked)).toContain(`get_billing (id "${idOf(await checkPendingCall({}))}") is still reading`);
+    d.resolve(ok('bills'));
+    await read;
+  });
 });

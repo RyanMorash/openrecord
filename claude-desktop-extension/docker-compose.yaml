@@ -1,0 +1,17 @@
+# One replica. Pending 2FA, parked tool calls, and the live MyChart session
+# are in this process; a second copy would not see them.
+services:
+  openrecord:
+    build:
+      context: ..
+      dockerfile: claude-desktop-extension/Dockerfile
+    ports:
+      - "8787:8787"
+    environment:
+      OPENRECORD_MCP_TOKEN: ${OPENRECORD_MCP_TOKEN:?Set OPENRECORD_MCP_TOKEN}
+    volumes:
+      - openrecord-mcpb:/data
+    restart: unless-stopped
+
+volumes:
+  openrecord-mcpb:

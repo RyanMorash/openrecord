@@ -23,6 +23,10 @@ setLogSink((level, args) => {
  * user_config is required — all auth happens via the in-chat setup_account
  * tool, which uses MCP elicitation to deterministically collect each field
  * (instance picker → username + password → 2FA → passkey opt-in).
+ *
+ * `node dist/server.cjs --http` is the container entry. Same tools, Streamable
+ * HTTP on /mcp, bearer token required. Stdio stays the default so Claude
+ * Desktop's spawn line does not change.
  */
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -32,16 +36,9 @@ import { clearAllSessions } from './session-manager';
 import setupWidget from 'virtual:setup-widget';
 import { buildSetupUiHtml, SETUP_UI_MIME_TYPE, SETUP_UI_RESOURCE_META } from './ui';
 import { startDirectoryRefresh } from './directory-refresh';
+import { HTTP_PORT, startHttpServer } from './http';
 
-async function main(): Promise<void> {
-  const server = new McpServer(
-    {
-      name: 'openrecord',
-      version: '2.0.0',
-    },
-    {
-      capabilities: { tools: {}, resources: {} },
-      instructions:
+const INSTRUCTIONS =
         'OpenRecord connects this conversation to the user\'s MyChart patient portal. ' +
         '\n\n' +
         'EVERY data tool requires an `account` parameter — the MyChart hostname returned by ' +
@@ -90,11 +87,26 @@ async function main(): Promise<void> {
         'instance publishes about its health system to anyone — support phone lines, the bookable ' +
         'provider directory with clinic addresses, and billing entities. Use search_mycharts to find ' +
         'the hostname first. It never returns a fax number or an accepted-insurance list; MyChart ' +
-        'does not publish those.',
+        'does not publish those.';
+
+/** Appended only for `--http`. A proxy in front of the container often drops the response before the 2.5-minute park note is written. */
+const HTTP_INSTRUCTIONS =
+  '\n\n' +
+  'A dropped connection is not a failed scrape. The work keeps running after the client gives up. ' +
+  'Call check_pending_call with no id to list it, then with that id to collect the result. ' +
+  'Do not repeat the original tool call.';
+
+function createMcpServer(mode: 'stdio' | 'http'): McpServer {
+  const server = new McpServer(
+    {
+      name: 'openrecord',
+      version: '2.0.0',
+    },
+    {
+      capabilities: { tools: {}, resources: {} },
+      instructions: mode === 'http' ? INSTRUCTIONS + HTTP_INSTRUCTIONS : INSTRUCTIONS,
     },
   );
-
-  // ── Resources ─────────────────────────────────────────────────────────────
 
   // Serve the interactive setup widget HTML.
   const setupHtml = buildSetupUiHtml(setupWidget);
@@ -119,7 +131,34 @@ async function main(): Promise<void> {
   );
 
   registerAllTools(server);
+  return server;
+}
 
+async function main(): Promise<void> {
+  if (process.argv.includes('--http')) {
+    const token = process.env.OPENRECORD_MCP_TOKEN?.trim() ?? '';
+    if (!token) {
+      console.error('[openrecord] OPENRECORD_MCP_TOKEN is required for --http');
+      process.exit(1);
+    }
+    const listening = await startHttpServer({
+      token,
+      port: HTTP_PORT,
+      createServer: () => createMcpServer('http'),
+    });
+    startDirectoryRefresh();
+    // Stdio exits when the parent closes stdin. A container has no parent pipe;
+    // that handler would shut the server down as soon as it started.
+    const shutdown = () => {
+      clearAllSessions();
+      void listening.close().finally(() => process.exit(0));
+    };
+    process.on('SIGINT', shutdown);
+    process.on('SIGTERM', shutdown);
+    return;
+  }
+
+  const server = createMcpServer('stdio');
   const transport = new StdioServerTransport();
   await server.connect(transport);
   startDirectoryRefresh();

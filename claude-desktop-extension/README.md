@@ -15,6 +15,8 @@ bun run pack          # builds dist/server.cjs and produces openrecord.mcpb
 
 Then double-click `openrecord.mcpb` (or drag it into Claude Desktop → Settings → Extensions).
 
+The same server runs in Docker, on Streamable HTTP, for a Cloudflare MCP portal. See [Remote access](#remote-access).
+
 ## Use
 
 After installing, open a new Claude chat and say:
@@ -272,6 +274,74 @@ missing something. The field decisions per capability are in
 example output in every mode is in
 [`docs/processor-layer-examples.md`](../docs/processor-layer-examples.md).
 
+## Remote access
+
+`node dist/server.cjs --http` listens on `0.0.0.0:8787` at `/mcp`. Claude Desktop
+does not use this flag — with no flag the process stays a stdio server. The
+container is one household's chart: the volume holds a single
+`~/.openrecord-mcpb` store, and anyone the portal allows to turn the server on
+can use those accounts.
+
+```bash
+cd claude-desktop-extension
+export OPENRECORD_MCP_TOKEN="$(openssl rand -hex 32)"
+docker compose up --build -d
+```
+
+`OPENRECORD_MCP_TOKEN` is required. The process refuses to listen without it,
+and every `/mcp` request must send `Authorization: Bearer <token>`. A missing
+or wrong token is an empty `401` with no `WWW-Authenticate` header, so the
+portal does not treat this process as an OAuth server. Secrets are files under
+`/data/.openrecord-mcpb` (`OPENRECORD_SECRET_BACKEND=file`); the image has no
+OS keystore. `save_file` and `save_to_downloads` write under `/data` as well.
+Browser import reports unsupported. Sign-in is the tool-call path:
+`search_mycharts`, `setup_account`, `complete_2fa`, `register_passkey`.
+
+Run one container. Pending 2FA, parked calls, and the live MyChart session are
+in that process.
+
+Put the container where the portal can reach it, either as a public HTTPS URL
+or as a private hostname through Cloudflare Tunnel with server-level Gateway
+routing turned on. The portal's Allow policy does not cover a direct request
+to the container. The bearer token is what does.
+
+In the [Cloudflare dashboard](https://developers.cloudflare.com/cloudflare-one/access-controls/ai-controls/mcp-portals/),
+Zero Trust → Access controls → MCP Portals → MCP servers → Add:
+
+- HTTP URL ending in `/mcp`, for example `https://<host>/mcp`
+- Authentication: bearer. The credential is the same `OPENRECORD_MCP_TOKEN`
+- An Allow policy for the people who may see the server
+
+Add that server to the portal and leave **Require user auth** off. The portal
+then sends the bearer token on each request. This server has no OAuth login
+of its own. Access login on the portal is how Cursor and Grok identify the
+user; they never see the container token.
+
+Cursor, in `mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "openrecord": {
+      "url": "https://<portal-host>/mcp"
+    }
+  }
+}
+```
+
+Grok uses that same portal URL as a remote MCP server. Both complete the
+Cloudflare Access login in a browser. The portal homepage
+(`https://<portal-host>/`, not `/mcp`) lists the endpoint and per-client steps.
+A client that cannot complete Access OAuth on its own can use the `mcp-remote`
+command Cloudflare documents for portal config files.
+
+A proxy in front of the container often closes a response around 100 seconds.
+A scrape that outruns that keeps running. The HTTP server's instructions tell
+the model to call `check_pending_call` and not to repeat the original tool.
+
+This path is not the desktop privacy story below. Tool results pass through
+Cloudflare and the MCP client (Cursor or xAI), not only through Anthropic.
+
 ## Privacy Policy
 
 **[openrecord.fanpierlabs.com/privacy.html](https://openrecord.fanpierlabs.com/privacy.html)** —
@@ -288,6 +358,8 @@ The short version, for what this extension does:
 - **Your chart reaches Anthropic, and nobody else.** Whatever Claude reads
   through these tools goes to Anthropic under your own Claude account, governed
   by Anthropic's terms and privacy policy. Nothing passes through Fan Pier Labs.
+  The [Docker deployment](#remote-access) is the exception: those tool results
+  also pass through Cloudflare and the MCP client.
 - **Anonymous usage events.** Startup and login events carry a random
   per-install id, the MyChart hostname being signed in to, and OS/runtime
   versions — never your username, password, or anything from your record.
@@ -299,7 +371,9 @@ The short version, for what this extension does:
 
 - **stdio MCP server** — speaks the 2025-06-18 MCP protocol with elicitation
   support. Claude Desktop ships its own Node runtime; no Node install needed
-  on the user's machine.
+  on the user's machine. `--http` is the same server on Streamable HTTP, for
+  the Docker image; it keeps a session id because pending 2FA and parked calls
+  live in the process.
 - **Pure JS, with one exception** — no `sharp`, no `sqlite3`. CLO → JPEG imaging
   conversion calls the shared pure-JS exporter (`convertCloToJpgPureJs` in
   `scrapers/myChart/clo-image-parser/exporters/`), which is
@@ -365,6 +439,8 @@ The short version, for what this extension does:
 claude-desktop-extension/
 ├── manifest.json           # MCPB manifest (see https://github.com/modelcontextprotocol/mcpb)
 ├── package.json
+├── Dockerfile              # --http image; build context is the repo root
+├── docker-compose.yaml     # publishes 8787, token from OPENRECORD_MCP_TOKEN
 ├── tsup.config.ts          # CJS bundle for Claude Desktop's Node (@napi-rs/keyring stays external)
 ├── smoke.mjs               # boots the built bundle and speaks MCP to it
 ├── icon.png                # 256×256 extension icon
@@ -372,7 +448,8 @@ claude-desktop-extension/
 │   ├── verify-native-binaries.mjs # refuses to pack without every platform's keyring binary
 │   └── sign-mcpb.mjs              # signs a release with the Developer ID (see below)
 └── src/
-    ├── index.ts            # stdio entry
+    ├── index.ts            # stdio entry; --http switches on the listener in http.ts
+    ├── http.ts             # Streamable HTTP on :8787, bearer token required
     ├── tools.ts            # account meta tools + one tool per shared capability
     ├── setup-flow.ts       # elicitation-driven setup wizard
     ├── session-manager.ts  # per-account session cache with keepalive + passkey auto-login

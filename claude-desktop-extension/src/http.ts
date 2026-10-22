@@ -83,6 +83,9 @@ export function startHttpServer(options: {
   }
 
   const sessions = new Map<string, Session>();
+  // An initialize is not in `sessions` until its body has been read. Count it
+  // now so concurrent handshakes cannot all pass the cap.
+  let pendingInits = 0;
   let closed = false;
 
   function drop(session: Session): void {
@@ -97,10 +100,10 @@ export function startHttpServer(options: {
     }
   }
 
-  /** Close the oldest idle session until a new one fits. False when every slot is mid-request. */
+  /** Close the oldest idle session until a new one fits. False when every slot is mid-request or still starting. */
   function makeRoom(): boolean {
     expireIdle();
-    while (sessions.size >= maxSessions) {
+    while (sessions.size + pendingInits >= maxSessions) {
       const idle = [...sessions.values()].filter((session) => session.inflight === 0).sort((a, b) => a.lastUsed - b.lastUsed);
       const victim = idle[0];
       if (!victim) return false;
@@ -114,30 +117,43 @@ export function startHttpServer(options: {
       jsonError(req, res, 503, 'Too many MCP sessions');
       return;
     }
-    const mcp = newMcpServer();
-    const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: () => randomUUID(),
-      onsessioninitialized: (sessionId) => {
-        sessions.set(sessionId, { transport, lastUsed: Date.now(), inflight: 1 });
-      },
-    });
-    // Set before connect(): the protocol wraps whatever onclose is already there.
-    transport.onclose = () => {
-      const id = transport.sessionId;
-      if (id) sessions.delete(id);
+    // Take the slot before the first await. The body is read inside handleRequest,
+    // and that is where the session actually joins the map.
+    pendingInits += 1;
+    let held = true;
+    const releaseReservation = (): void => {
+      if (!held) return;
+      held = false;
+      pendingInits -= 1;
     };
+    let transport: StreamableHTTPServerTransport | undefined;
     try {
+      const mcp = newMcpServer();
+      transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => randomUUID(),
+        onsessioninitialized: (sessionId) => {
+          if (!transport) return;
+          sessions.set(sessionId, { transport, lastUsed: Date.now(), inflight: 1 });
+          releaseReservation();
+        },
+      });
+      // Set before connect(): the protocol wraps whatever onclose is already there.
+      transport.onclose = () => {
+        const id = transport?.sessionId;
+        if (id) sessions.delete(id);
+      };
       // The class types onclose as `(() => void) | undefined`. With
       // exactOptionalPropertyTypes that is not a Transport, whose callback is
       // optional but never explicitly undefined.
       await mcp.connect(transport as Transport);
       await transport.handleRequest(req, res);
     } finally {
-      const id = transport.sessionId;
+      releaseReservation();
+      const id = transport?.sessionId;
       const session = id ? sessions.get(id) : undefined;
       if (!session) {
         // A POST that was not initialize never joins the map.
-        await transport.close();
+        if (transport) await transport.close();
       } else {
         session.inflight -= 1;
         session.lastUsed = Date.now();

@@ -6,6 +6,7 @@
  * listener, the bearer check, and the session map.
  */
 import { afterEach, describe, expect, it } from 'bun:test';
+import { request as httpRequest } from 'node:http';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { startHttpServer, type HttpServer } from '../http';
 
@@ -22,20 +23,51 @@ const mcpHeaders = {
   accept: 'application/json, text/event-stream',
 };
 
+const INITIALIZE_BODY = JSON.stringify({
+  jsonrpc: '2.0',
+  id: 1,
+  method: 'initialize',
+  params: {
+    protocolVersion: '2025-06-18',
+    capabilities: {},
+    clientInfo: { name: 'http-unit', version: '0.0.0' },
+  },
+});
+
+/** Headers only. The body stays unsent so the server is inside initialize before the session exists. */
+function holdInitialize(port: number): {
+  finish: (body: string) => void;
+  result: Promise<{ status: number; sessionId: string | undefined }>;
+} {
+  let finishBody: ((body: string) => void) | undefined;
+  const result = new Promise<{ status: number; sessionId: string | undefined }>((resolve, reject) => {
+    const req = httpRequest(
+      {
+        hostname: '127.0.0.1',
+        port,
+        path: '/mcp',
+        method: 'POST',
+        headers: { ...mcpHeaders, 'content-length': Buffer.byteLength(INITIALIZE_BODY) },
+      },
+      (res) => {
+        const raw = res.headers['mcp-session-id'];
+        const sessionId = typeof raw === 'string' ? raw : undefined;
+        res.resume();
+        res.on('end', () => resolve({ status: res.statusCode ?? 0, sessionId }));
+      },
+    );
+    req.on('error', reject);
+    finishBody = (body: string) => req.end(body);
+    req.flushHeaders();
+  });
+  return { finish: (body: string) => finishBody?.(body), result };
+}
+
 async function initialize(url: string): Promise<string> {
   const init = await fetch(url, {
     method: 'POST',
     headers: mcpHeaders,
-    body: JSON.stringify({
-      jsonrpc: '2.0',
-      id: 1,
-      method: 'initialize',
-      params: {
-        protocolVersion: '2025-06-18',
-        capabilities: {},
-        clientInfo: { name: 'http-unit', version: '0.0.0' },
-      },
-    }),
+    body: INITIALIZE_BODY,
   });
   expect(init.status).toBe(200);
   const sessionId = init.headers.get('mcp-session-id');
@@ -242,5 +274,24 @@ describe('startHttpServer', () => {
     });
     expect(ping.status).toBe(404);
     expect(next).not.toBe(sessionId);
+  });
+
+  it('counts an initialize against the cap before the session is registered', async () => {
+    listening = await startHttpServer({ token: TOKEN, port: 0, createServer: bareServer, idleMs: 60_000, maxSessions: 1 });
+    const url = `http://127.0.0.1:${listening.port}/mcp`;
+    const held = holdInitialize(listening.port);
+    await sleep(50);
+
+    const refused = await fetch(url, { method: 'POST', headers: mcpHeaders, body: INITIALIZE_BODY });
+    expect(refused.status).toBe(503);
+    await refused.text();
+
+    held.finish('x'.repeat(Buffer.byteLength(INITIALIZE_BODY)));
+    const failed = await held.result;
+    expect(failed.status).not.toBe(200);
+    expect(failed.sessionId).toBeUndefined();
+
+    const next = await initialize(url);
+    expect(next).toBeTruthy();
   });
 });

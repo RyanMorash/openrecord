@@ -30,8 +30,16 @@
  * takes an abort signal, so the work runs on and a write already sent lands.
  */
 
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'crypto';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+
+/** Set by the HTTP server for the request it is answering. A dropped response aborts it. Stdio never sets it. */
+const lostResponse = new AsyncLocalStorage<AbortSignal>();
+
+export function withLostResponse<T>(signal: AbortSignal, fn: () => Promise<T>): Promise<T> {
+  return lostResponse.run(signal, fn);
+}
 
 export const CHECK_TOOL = 'check_pending_call';
 const DESKTOP_DEADLINE_MS = 150_000;
@@ -75,6 +83,12 @@ interface Parked {
 }
 
 const parked = new Map<string, Parked>();
+/** Collections blocked inside the wait. The disconnect test waits until this is non-zero. */
+let waitingCollections = 0;
+
+export function collectionWaitsInFlight(): number {
+  return waitingCollections;
+}
 
 /**
  * Why a call that is no longer parked went away, kept for the last few, so a
@@ -132,13 +146,41 @@ function canonical(value: unknown): string {
   return JSON.stringify(value) ?? 'null';
 }
 
-/** The result if it arrives within `ms`, else undefined. Never rejects. */
-function settleWithin(promise: Promise<CallToolResult>, ms: number): Promise<CallToolResult | undefined> {
+/** The result if it arrives within `ms`, else undefined. An aborted signal ends the wait and is not a result. Never rejects. */
+function settleWithin(promise: Promise<CallToolResult>, ms: number, signal?: AbortSignal): Promise<CallToolResult | undefined> {
+  if (ms <= 0 || signal?.aborted) return Promise.resolve(undefined);
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let onAbort: (() => void) | undefined;
   const deadline = new Promise<undefined>((resolve) => {
     timer = setTimeout(() => resolve(undefined), ms);
+    if (!signal) return;
+    onAbort = () => resolve(undefined);
+    signal.addEventListener('abort', onAbort, { once: true });
   });
-  return Promise.race([promise, deadline]).finally(() => clearTimeout(timer));
+  return Promise.race([promise, deadline]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer);
+    if (signal && onAbort) signal.removeEventListener('abort', onAbort);
+  });
+}
+
+/** `notifications/cancelled` and a dropped HTTP response are both "the caller did not get this". */
+function linkSignals(explicit: AbortSignal | undefined, transport: AbortSignal | undefined): { signal: AbortSignal | undefined; stop: () => void } {
+  if (!explicit) return { signal: transport, stop: () => {} };
+  if (!transport) return { signal: explicit, stop: () => {} };
+  const linked = new AbortController();
+  const onAbort = (): void => linked.abort();
+  if (explicit.aborted || transport.aborted) linked.abort();
+  else {
+    explicit.addEventListener('abort', onAbort);
+    transport.addEventListener('abort', onAbort);
+  }
+  return {
+    signal: linked.signal,
+    stop: () => {
+      explicit.removeEventListener('abort', onAbort);
+      transport.removeEventListener('abort', onAbort);
+    },
+  };
 }
 
 function sweep(now: number): void {
@@ -215,10 +257,16 @@ export function unsettledCallOnAccount(account: string): { tool: string; id: str
   return [...parked.values()].find((p) => p.settledAt === undefined && p.account === wanted);
 }
 
-/** The `check_pending_call` handler. `deadlineMs` is the test seam. */
+/**
+ * The `check_pending_call` handler. `deadlineMs` is the test seam.
+ * `signal` is the MCP request's cancel signal. A dropped HTTP response is
+ * noticed through `withLostResponse` and treated the same way: the result
+ * stays parked, because this return never reached the client.
+ */
 export async function checkPendingCall(
   { id, wait, abandon }: { id?: string; wait?: boolean; abandon?: boolean },
   deadlineMs = parkDeadlineMs,
+  signal?: AbortSignal,
 ): Promise<CallToolResult> {
   const now = Date.now();
   sweep(now);
@@ -248,30 +296,52 @@ export async function checkPendingCall(
   // free — which is exactly what switch_proxy_target's refusal tells them to
   // do. Short-circuiting here instead left that instruction unfollowable.
   const discarded = p.abandoned === true;
+  const linked = linkSignals(signal, lostResponse.getStore());
+  const stop = linked.signal;
 
-  // A wait that would run past the cap is cut to the cap, and running that
-  // out means the cap is reached even if the test clock never moved.
-  const remaining = MAX_RUN_MS - (now - p.startedAt);
-  const clipped = remaining <= deadlineMs;
-  const result = p.result ?? (wait === false ? undefined : await settleWithin(p.promise, clipped ? remaining : deadlineMs));
-  if (result) {
-    forget(p, discarded ? 'abandoned, and its result discarded when it finished' : 'collected');
-    if (!discarded) return result;
-    const freed = p.account ? ` switch_proxy_target on ${p.account} is free again.` : '';
-    return text(`${p.tool} has finished, and its result was discarded because the call was abandoned.${freed}`);
+  try {
+    // A wait that would run past the cap is cut to the cap, and running that
+    // out means the cap is reached even if the test clock never moved.
+    const remaining = MAX_RUN_MS - (now - p.startedAt);
+    const clipped = remaining <= deadlineMs;
+    let result = p.result;
+    if (result === undefined && wait !== false && !stop?.aborted) {
+      waitingCollections += 1;
+      try {
+        result = await settleWithin(p.promise, clipped ? remaining : deadlineMs, stop);
+      } finally {
+        waitingCollections -= 1;
+      }
+    }
+    // Checked before forget. The result may have landed during the wait, on a
+    // connection that is already gone; removing it here is what made a retry
+    // report the call as collected.
+    if (stop?.aborted) {
+      const how = `Call ${CHECK_TOOL} again to keep waiting, or with abandon: true to stop waiting. ${ABANDON_MEANS}`;
+      return stillRunning(`${p.tool} (id "${id}") is still running (${elapsed(p.startedAt, Date.now())} so far, of at most 10 minutes). ${how}`, id);
+    }
+    if (result) {
+      forget(p, discarded ? 'abandoned, and its result discarded when it finished' : 'collected');
+      if (!discarded) return result;
+      const freed = p.account ? ` switch_proxy_target on ${p.account} is free again.` : '';
+      return text(`${p.tool} has finished, and its result was discarded because the call was abandoned.${freed}`);
+    }
+    if (wait !== false && clipped) {
+      forget(p, 'given up on after running 10 minutes');
+      return text(`Gave up on ${p.tool} after 10 minutes. Its result is discarded and this account is no longer held. ${ABANDON_MEANS}`, true);
+    }
+    const how = discarded
+      ? `Its result will be discarded, because it was abandoned. Call ${CHECK_TOOL} again to wait for the account to come free.`
+      : `Call ${CHECK_TOOL} again to keep waiting, or with abandon: true to stop waiting. ${ABANDON_MEANS}`;
+    return stillRunning(`${p.tool} (id "${id}") is still running (${elapsed(p.startedAt, Date.now())} so far, of at most 10 minutes). ${how}`, id);
+  } finally {
+    linked.stop();
   }
-  if (wait !== false && clipped) {
-    forget(p, 'given up on after running 10 minutes');
-    return text(`Gave up on ${p.tool} after 10 minutes. Its result is discarded and this account is no longer held. ${ABANDON_MEANS}`, true);
-  }
-  const how = discarded
-    ? `Its result will be discarded, because it was abandoned. Call ${CHECK_TOOL} again to wait for the account to come free.`
-    : `Call ${CHECK_TOOL} again to keep waiting, or with abandon: true to stop waiting. ${ABANDON_MEANS}`;
-  return stillRunning(`${p.tool} (id "${id}") is still running (${elapsed(p.startedAt, Date.now())} so far, of at most 10 minutes). ${how}`, id);
 }
 
 /** Test seam. */
 export function resetPendingCalls(): void {
   parked.clear();
   gone.clear();
+  waitingCollections = 0;
 }

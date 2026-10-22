@@ -98,7 +98,8 @@ const LONG_CALLS_HTTP =
   'and returns a note carrying an id instead of its result. That note is sent inside the minute, ' +
   'before a proxy that closes a response around 100 seconds drops the connection. Collect the result ' +
   'with check_pending_call(id). A collection waits at most 1 minute and leaves a result that is not ' +
-  'ready yet parked, so a dropped connection does not discard it. Never repeat that call with the same ' +
+  'ready yet parked. If that collection\'s connection drops, the result stays parked under the same id, ' +
+  'including when the work finishes after the drop. Never repeat that call with the same ' +
   'arguments while it is pending — it is already running and would be refused, and a tool that sends ' +
   'something would send it twice. Other tools are unaffected, except switch_proxy_target on that ' +
   'account, which waits for the read.';

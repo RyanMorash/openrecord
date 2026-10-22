@@ -648,12 +648,16 @@ function registerCheckPendingCall(server: McpServer): void {
       // Not read-only: abandon discards a result.
       ...toolMeta('Check a pending tool call', { readOnlyHint: false, destructiveHint: false, openWorldHint: false }),
     },
-    ({ id, wait, abandon }) =>
-      checkPendingCall({
-        ...(id !== undefined ? { id } : {}),
-        ...(wait !== undefined ? { wait } : {}),
-        ...(abandon !== undefined ? { abandon } : {}),
-      }),
+    ({ id, wait, abandon }, extra?: { signal?: AbortSignal }) =>
+      checkPendingCall(
+        {
+          ...(id !== undefined ? { id } : {}),
+          ...(wait !== undefined ? { wait } : {}),
+          ...(abandon !== undefined ? { abandon } : {}),
+        },
+        undefined,
+        extra?.signal,
+      ),
   );
 }
 

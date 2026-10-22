@@ -343,7 +343,7 @@ command Cloudflare documents for portal config files.
 A proxy in front of the container often closes a response around 100 seconds.
 HTTP mode parks a call after 1 minute, and `check_pending_call` waits at most
 1 minute, so the park note and a collection answer are both written before that
-cutoff. A result that is not ready yet stays parked. An MCP session that has
+cutoff. A result that is not ready yet stays parked, and so does one whose collection was disconnected. An MCP session that has
 been idle for 30 minutes is dropped, and the process keeps at most 8 sessions,
 so a client that reconnects without ending the old one does not accumulate
 transports. A session with a request in flight is kept.

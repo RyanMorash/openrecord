@@ -211,6 +211,19 @@ describe('http park deadline', () => {
     await tick();
     expect(await checkPendingCall({ id })).toEqual(ok('profile'));
   });
+
+  it('keeps a result that arrives after the collection is aborted', async () => {
+    const d = deferred();
+    const id = idOf(await runGuarded('get_profile', ACCOUNT, d.fn, 5));
+    const ac = new AbortController();
+    const waiting = checkPendingCall({ id }, 5_000, ac.signal);
+    await tick();
+    ac.abort();
+    d.resolve(ok('profile'));
+    await tick();
+    expect(text(await waiting)).toContain('is still running');
+    expect(await checkPendingCall({ id, wait: false })).toEqual(ok('profile'));
+  });
 });
 
 describe('registered through the server', () => {

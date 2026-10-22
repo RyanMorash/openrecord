@@ -21,6 +21,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
+import { withLostResponse } from './pending-call';
 
 /** `--http` always binds this. The image and compose file publish it. */
 export const HTTP_PORT = 8787;
@@ -58,6 +59,22 @@ function endEmpty(req: IncomingMessage, res: ServerResponse, status: number): vo
   req.resume();
   res.writeHead(status);
   res.end();
+}
+
+/**
+ * A proxy drops the socket without `notifications/cancelled`, which is the
+ * only abort the SDK raises on its own. Closing before the response was ended
+ * is that drop.
+ */
+function handleOnTransport(transport: StreamableHTTPServerTransport, req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const lost = new AbortController();
+  const onClose = (): void => {
+    if (!res.writableEnded) lost.abort();
+  };
+  res.on('close', onClose);
+  return withLostResponse(lost.signal, () => transport.handleRequest(req, res)).finally(() => {
+    res.off('close', onClose);
+  });
 }
 
 function jsonError(req: IncomingMessage, res: ServerResponse, status: number, message: string): void {
@@ -146,7 +163,7 @@ export function startHttpServer(options: {
       // exactOptionalPropertyTypes that is not a Transport, whose callback is
       // optional but never explicitly undefined.
       await mcp.connect(transport as Transport);
-      await transport.handleRequest(req, res);
+      await handleOnTransport(transport, req, res);
     } finally {
       releaseReservation();
       const id = transport?.sessionId;
@@ -194,7 +211,7 @@ export function startHttpServer(options: {
     existing.inflight += 1;
     existing.lastUsed = Date.now();
     try {
-      await existing.transport.handleRequest(req, res);
+      await handleOnTransport(existing.transport, req, res);
     } finally {
       existing.inflight -= 1;
       existing.lastUsed = Date.now();

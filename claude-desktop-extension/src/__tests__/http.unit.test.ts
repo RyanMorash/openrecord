@@ -8,7 +8,10 @@
 import { afterEach, describe, expect, it } from 'bun:test';
 import { request as httpRequest } from 'node:http';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+import { z } from 'zod';
 import { startHttpServer, type HttpServer } from '../http';
+import { checkPendingCall, collectionWaitsInFlight, runGuarded } from '../pending-call';
 
 const TOKEN = 'test-token';
 function sleep(ms: number): Promise<void> {
@@ -294,4 +297,95 @@ describe('startHttpServer', () => {
     const next = await initialize(url);
     expect(next).toBeTruthy();
   });
+
+  it('keeps a parked result when the waiting collection is disconnected', async () => {
+    let release: (result: CallToolResult) => void = () => {};
+    const work = new Promise<CallToolResult>((resolve) => {
+      release = resolve;
+    });
+    listening = await startHttpServer({
+      token: TOKEN,
+      port: 0,
+      idleMs: 60_000,
+      maxSessions: 2,
+      createServer: () => {
+        const mcp = new McpServer({ name: 'openrecord-test', version: '0.0.0' });
+        mcp.registerTool('slow_read', { description: 'test', inputSchema: {} }, () => runGuarded('slow_read', {}, () => work, 15));
+        mcp.registerTool(
+          'check_pending_call',
+          { description: 'test', inputSchema: { id: z.string().optional(), wait: z.boolean().optional() } },
+          (args) =>
+            checkPendingCall({
+              ...(args.id !== undefined ? { id: args.id } : {}),
+              ...(args.wait !== undefined ? { wait: args.wait } : {}),
+            }),
+        );
+        return mcp;
+      },
+    });
+    const port = listening.port;
+    const url = `http://127.0.0.1:${port}/mcp`;
+    const sessionId = await initialize(url);
+    const headers = { ...mcpHeaders, 'mcp-session-id': sessionId, 'mcp-protocol-version': '2025-06-18' };
+    const call = (id: number, name: string, args: Record<string, unknown>) =>
+      fetch(url, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name, arguments: args } }),
+      });
+
+    const parked = await call(2, 'slow_read', {});
+    expect(parked.status).toBe(200);
+    const parkedText = toolText(await readRpc(parked));
+    const parkedId = /id "([^"]+)"/.exec(parkedText)?.[1];
+    expect(parkedId).toBeTruthy();
+
+    const collectBody = JSON.stringify({
+      jsonrpc: '2.0',
+      id: 3,
+      method: 'tools/call',
+      params: { name: 'check_pending_call', arguments: { id: parkedId } },
+    });
+    await new Promise<void>((resolve, reject) => {
+      const req = httpRequest(
+        {
+          hostname: '127.0.0.1',
+          port,
+          path: '/mcp',
+          method: 'POST',
+          headers: { ...headers, 'content-length': Buffer.byteLength(collectBody) },
+        },
+        (res) => {
+          res.resume();
+        },
+      );
+      req.on('error', () => {});
+      req.end(collectBody);
+      void (async () => {
+        const started = Date.now();
+        while (collectionWaitsInFlight() === 0) {
+          if (Date.now() - started > 1000) {
+            req.destroy();
+            reject(new Error('collection never started waiting'));
+            return;
+          }
+          await sleep(5);
+        }
+        req.destroy();
+        resolve();
+      })();
+    });
+
+    await sleep(30);
+    release({ content: [{ type: 'text', text: 'labs' }] });
+    await sleep(20);
+    const again = await call(4, 'check_pending_call', { id: parkedId, wait: false });
+    expect(again.status).toBe(200);
+    expect(toolText(await readRpc(again))).toBe('labs');
+  });
 });
+
+function toolText(body: unknown): string {
+  const message = body as { result?: { content?: { text?: string }[] } };
+  return message.result?.content?.[0]?.text ?? '';
+}

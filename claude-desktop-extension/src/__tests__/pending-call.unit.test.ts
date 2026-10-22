@@ -289,6 +289,29 @@ describe('http park deadline', () => {
     expect(await withLostResponse(new AbortController().signal, () => runGuarded('send_message', ACCOUNT, () => ok('fresh'), 50))).toEqual(ok('fresh'));
   });
 
+  it('discards the result when an HTTP call is abandoned while its callers are waiting', async () => {
+    const d = deferred();
+    let runs = 0;
+    const run = (): Promise<CallToolResult> => {
+      runs += 1;
+      return d.fn();
+    };
+    const owner = withLostResponse(new AbortController().signal, () => runGuarded('send_message', ACCOUNT, run, 5_000));
+    await tick();
+    const joiner = withLostResponse(new AbortController().signal, () => runGuarded('send_message', ACCOUNT, run, 5_000));
+    await tick();
+    expect(runs).toBe(1);
+    const id = idOf(await checkPendingCall({}));
+    expect(text(await checkPendingCall({ id, abandon: true }))).toContain('already sent still lands');
+    d.resolve(ok('sent'));
+    const ownerText = text(await owner);
+    const joinerText = text(await joiner);
+    expect(ownerText).toContain('its result was discarded');
+    expect(ownerText).not.toContain('sent');
+    expect(joinerText).toContain('its result was discarded');
+    expect(runs).toBe(1);
+  });
+
   it('parks a finished call when the original request is aborted', async () => {
     const d = deferred();
     const ac = new AbortController();

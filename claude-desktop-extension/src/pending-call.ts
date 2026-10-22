@@ -18,7 +18,9 @@
  * connection the proxy had already closed. One minute is inside that window
  * for both the park note and a collection wait. A disconnect before that
  * minute is the same hole, so an aborted wait parks instead of returning.
- * Desktop is unchanged.
+ * A finished HTTP result stays reserved until that response has ended, and
+ * abandoning the call while its request is still waiting returns a discard
+ * note instead of the payload. Desktop is unchanged.
  *
  * Calls are not serialized — the same log shows Claude Desktop issuing a
  * second call 5.5 s after an unanswered first — so several may park. On
@@ -41,11 +43,20 @@ import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
 /** Set by the HTTP server for the request it is answering. A dropped response aborts it. Stdio never sets it. */
 const lostResponse = new AsyncLocalStorage<AbortSignal>();
+/**
+ * Set by the HTTP server so a finished result is forgotten only once that response has ended.
+ * Stdio never sets it, and forgets as soon as the handler returns.
+ */
+const responseDelivery = new AsyncLocalStorage<(cb: (wrote: boolean) => void) => void>();
 /** The HTTP reservation whose handler is running. It is already in `parked`, and is not a second call. */
 const executingCall = new AsyncLocalStorage<string>();
 
 export function withLostResponse<T>(signal: AbortSignal, fn: () => Promise<T>): Promise<T> {
   return lostResponse.run(signal, fn);
+}
+
+export function withResponseDelivery<T>(notify: (cb: (wrote: boolean) => void) => void, fn: () => Promise<T>): Promise<T> {
+  return responseDelivery.run(notify, fn);
 }
 
 export const CHECK_TOOL = 'check_pending_call';
@@ -236,10 +247,34 @@ function parkNote(tool: string, id: string): string {
   );
 }
 
-/** Hand a parked result to a caller that is still connected, so a later retry does not run the tool again. */
-function deliverParked(entry: Parked): void {
-  entry.delivered = true;
-  if (parked.has(entry.id)) forget(entry, 'collected');
+/** The result was abandoned while a caller was still waiting. They get the discard note, not the payload. */
+function discardFinished(entry: Parked): CallToolResult {
+  forget(entry, 'abandoned, and its result discarded when it finished');
+  const freed = entry.account ? ` switch_proxy_target on ${entry.account} is free again.` : '';
+  return text(`${entry.tool} has finished, and its result was discarded because the call was abandoned.${freed}`);
+}
+
+/**
+ * Forget a result a caller is about to receive. On HTTP that waits until the response has ended:
+ * the handler returning is not the client having the bytes, and a socket that closes first must
+ * leave the result parked so a retry does not run the tool again.
+ */
+function releaseIfWritten(entry: Parked, why: string): void {
+  const forgetWritten = (wrote: boolean): void => {
+    if (!wrote || !parked.has(entry.id)) return;
+    if (entry.abandoned) {
+      forget(entry, 'abandoned, and its result discarded when it finished');
+      return;
+    }
+    entry.delivered = true;
+    forget(entry, why);
+  };
+  const notify = responseDelivery.getStore();
+  if (!notify) {
+    forgetWritten(true);
+    return;
+  }
+  notify(forgetWritten);
 }
 
 /** A second HTTP request for a call that is already running. One execution, shared result. */
@@ -255,7 +290,8 @@ async function joinParked(entry: Parked, deadlineMs: number, signal?: AbortSigna
     linked.stop();
   }
   if (stop?.aborted || !result) return stillRunning(parkNote(entry.tool, entry.id), entry.id);
-  deliverParked(entry);
+  if (entry.abandoned) return discardFinished(entry);
+  releaseIfWritten(entry, 'collected');
   return result;
 }
 
@@ -311,7 +347,12 @@ export async function runGuarded(
   // A disconnect during this wait must not take the direct return. The bytes
   // would go nowhere, the call would not be parked, and a retry could send twice.
   if (result && !stop?.aborted) {
-    if (reserved) deliverParked(reserved);
+    if (reserved?.abandoned) return discardFinished(reserved);
+    if (reserved) {
+      reserved.result = result;
+      reserved.settledAt ??= Date.now();
+      releaseIfWritten(reserved, 'collected');
+    }
     return result;
   }
   if (reserved?.delivered) return result ?? reserved.result ?? stillRunning(parkNote(tool, reserved.id), reserved.id);
@@ -406,10 +447,9 @@ export async function checkPendingCall(
       return stillRunning(`${p.tool} (id "${id}") is still running (${elapsed(p.startedAt, Date.now())} so far, of at most 10 minutes). ${how}`, id);
     }
     if (result) {
-      forget(p, discarded ? 'abandoned, and its result discarded when it finished' : 'collected');
-      if (!discarded) return result;
-      const freed = p.account ? ` switch_proxy_target on ${p.account} is free again.` : '';
-      return text(`${p.tool} has finished, and its result was discarded because the call was abandoned.${freed}`);
+      if (discarded) return discardFinished(p);
+      releaseIfWritten(p, 'collected');
+      return result;
     }
     if (wait !== false && clipped) {
       forget(p, 'given up on after running 10 minutes');

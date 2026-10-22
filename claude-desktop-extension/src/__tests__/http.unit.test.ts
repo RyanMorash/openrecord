@@ -6,7 +6,7 @@
  * listener, the bearer check, and the session map.
  */
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
-import { request as httpRequest } from 'node:http';
+import { ServerResponse, request as httpRequest } from 'node:http';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
@@ -304,13 +304,17 @@ describe('startHttpServer', () => {
   });
 
   it('returns a finished tool result on a connection that stays open', async () => {
+    let runs = 0;
     listening = await startHttpServer({
       token: TOKEN,
       port: 0,
       createServer: () => {
         const mcp = new McpServer({ name: 'openrecord-test', version: '0.0.0' });
         mcp.registerTool('slow_read', { description: 'test', inputSchema: {} }, () =>
-          runGuarded('slow_read', {}, () => ({ content: [{ type: 'text', text: 'ready' }] }), 5_000),
+          runGuarded('slow_read', {}, () => {
+            runs += 1;
+            return { content: [{ type: 'text', text: 'ready' }] };
+          }, 5_000),
         );
         return mcp;
       },
@@ -332,6 +336,74 @@ describe('startHttpServer', () => {
       body: JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'slow_read', arguments: {} } }),
     });
     expect(toolText(await readRpc(again))).toBe('ready');
+    expect(runs).toBe(2);
+  });
+
+  it('keeps a finished result when its response is destroyed before it ends', async () => {
+    let runs = 0;
+    let release: (result: CallToolResult) => void = () => {};
+    const work = new Promise<CallToolResult>((resolve) => {
+      release = resolve;
+    });
+    // The replacement has to call the real end for every response except the one this test drops.
+    // eslint-disable-next-line @typescript-eslint/unbound-method
+    const originalEnd = ServerResponse.prototype.end;
+    let armed = false;
+    ServerResponse.prototype.end = function (this: ServerResponse, ...args: never[]) {
+      if (!armed) return originalEnd.apply(this, args as unknown as [chunk: unknown, encoding: BufferEncoding, cb?: () => void]);
+      armed = false;
+      this.socket?.destroy();
+      this.req?.socket?.destroy();
+      return this;
+    } as typeof originalEnd;
+    try {
+      listening = await startHttpServer({
+        token: TOKEN,
+        port: 0,
+        createServer: () => {
+          const mcp = new McpServer({ name: 'openrecord-test', version: '0.0.0' });
+          mcp.registerTool('slow_read', { description: 'test', inputSchema: {} }, () =>
+            runGuarded('slow_read', {}, () => {
+              runs += 1;
+              return work;
+            }, 5_000),
+          );
+          return mcp;
+        },
+      });
+      const url = `http://127.0.0.1:${listening.port}/mcp`;
+      const sessionId = await initialize(url);
+      const headers = { ...mcpHeaders, 'mcp-session-id': sessionId, 'mcp-protocol-version': '2025-06-18' };
+      const call = (id: number) =>
+        fetch(url, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name: 'slow_read', arguments: {} } }),
+        });
+
+      const first = fetch(url, {
+        method: 'POST',
+        headers,
+        signal: AbortSignal.timeout(800),
+        body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'slow_read', arguments: {} } }),
+      });
+      const started = Date.now();
+      while (guardedWaitsInFlight() < 1) {
+        if (Date.now() - started > 1000) throw new Error('tool call never started waiting');
+        await sleep(5);
+      }
+      armed = true;
+      release({ content: [{ type: 'text', text: 'sent' }] });
+      await first.then((res) => res.text()).catch(() => undefined);
+      expect(runs).toBe(1);
+
+      const again = await call(3);
+      expect(again.status).toBe(200);
+      expect(toolText(await readRpc(again))).toBe('sent');
+      expect(runs).toBe(1);
+    } finally {
+      ServerResponse.prototype.end = originalEnd;
+    }
   });
 
   it('runs an identical in-flight HTTP call once', async () => {

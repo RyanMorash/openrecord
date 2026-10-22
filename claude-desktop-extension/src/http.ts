@@ -21,7 +21,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
-import { withLostResponse } from './pending-call';
+import { withLostResponse, withResponseDelivery } from './pending-call';
 
 /** `--http` always binds this. The image and compose file publish it. */
 export const HTTP_PORT = 8787;
@@ -68,12 +68,25 @@ function endEmpty(req: IncomingMessage, res: ServerResponse, status: number): vo
  */
 function handleOnTransport(transport: StreamableHTTPServerTransport, req: IncomingMessage, res: ServerResponse): Promise<void> {
   const lost = new AbortController();
-  const onClose = (): void => {
-    if (!res.writableEnded) lost.abort();
-  };
-  res.on('close', onClose);
-  return withLostResponse(lost.signal, () => transport.handleRequest(req, res)).finally(() => {
+  const waiters: Array<(wrote: boolean) => void> = [];
+  let settled = false;
+  const finish = (wrote: boolean): void => {
+    if (settled) return;
+    settled = true;
     res.off('close', onClose);
+    if (!wrote) lost.abort();
+    for (const waiter of waiters.splice(0)) waiter(wrote);
+  };
+  const onClose = (): void => finish(res.writableEnded);
+  res.on('close', onClose);
+  // `end()` may already have run when handleRequest resolves. `close` can still be queued,
+  // so a response that has ended is delivered even if that event has not fired.
+  const notify = (cb: (wrote: boolean) => void): void => {
+    if (settled) cb(res.writableEnded);
+    else waiters.push(cb);
+  };
+  return withResponseDelivery(notify, () => withLostResponse(lost.signal, () => transport.handleRequest(req, res))).finally(() => {
+    if (res.writableEnded) finish(true);
   });
 }
 

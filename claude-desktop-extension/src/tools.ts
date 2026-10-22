@@ -91,7 +91,7 @@ import {
   normalizeHostname,
 } from './credential-store';
 import { addPending, takePending } from './pending-logins';
-import { CHECK_TOOL, DEADLINE_LABEL, checkPendingCall, runGuarded, unsettledCallOnAccount } from './pending-call';
+import { CHECK_TOOL, checkPendingCall, currentParkDeadlineLabel, runGuarded, unsettledCallOnAccount } from './pending-call';
 import { releaseImportedCandidate, scanBrowserPasswords, takeImportedCandidate } from './browser-import';
 import { decodeStudy, encodeFullResolutionJpegs, type DecodedStudy } from './imaging/download-study';
 import { inlinePreviews } from './imaging/inline-preview';
@@ -614,9 +614,10 @@ async function connectWithPassword(hostname: string, username: string, password:
  */
 function guarded(server: McpServer): McpServer {
   const registerTool = (name: string, config: unknown, handler: (...a: unknown[]) => ToolResult | Promise<ToolResult>) =>
-    server.registerTool(name, config as never, (...a: unknown[]) =>
-      runGuarded(name, (a[0] ?? {}) as Record<string, unknown>, () => handler(...a)),
-    );
+    server.registerTool(name, config as never, (...a: unknown[]) => {
+      const extra = a[1] as { signal?: AbortSignal } | undefined;
+      return runGuarded(name, (a[0] ?? {}) as Record<string, unknown>, () => handler(...a), undefined, extra?.signal);
+    });
   return { registerTool } as unknown as McpServer;
 }
 
@@ -625,10 +626,10 @@ function registerCheckPendingCall(server: McpServer): void {
     CHECK_TOOL,
     {
       description:
-        `Collect the result of a tool call that ran past ${DEADLINE_LABEL} and was parked under an id, exactly as ` +
+        `Collect the result of a tool call that ran past ${currentParkDeadlineLabel()} and was parked under an id, exactly as ` +
         'the original tool would have returned it. A result that is ready is always handed over, and handed ' +
         'over once — including under `wait: false`, so this is a collection, never a peek. When the call is ' +
-        `still running it waits up to ${DEADLINE_LABEL} for it, or with \`wait: false\` says so at once. Omit ` +
+        `still running it waits up to ${currentParkDeadlineLabel()} for it, or with \`wait: false\` says so at once. Omit ` +
         '`id` to list every pending call, which is what a refusal naming an id is talking about. `abandon: ' +
         'true` stops waiting and discards the result — it does not stop the work, and anything already sent ' +
         'still lands, so an abandoned call is still waitable here until its read finishes. Two clocks: a call ' +
@@ -640,7 +641,7 @@ function registerCheckPendingCall(server: McpServer): void {
           .boolean()
           .optional()
           .describe(
-            `Wait up to ${DEADLINE_LABEL} for the call to finish (default true). false reports at once instead — ` +
+            `Wait up to ${currentParkDeadlineLabel()} for the call to finish (default true). false reports at once instead — ` +
               'but a result that is already ready is handed over, and consumed, either way.',
           ),
         abandon: z.boolean().optional().describe('Stop waiting and discard the result. Does not stop the work.'),
@@ -648,12 +649,16 @@ function registerCheckPendingCall(server: McpServer): void {
       // Not read-only: abandon discards a result.
       ...toolMeta('Check a pending tool call', { readOnlyHint: false, destructiveHint: false, openWorldHint: false }),
     },
-    ({ id, wait, abandon }) =>
-      checkPendingCall({
-        ...(id !== undefined ? { id } : {}),
-        ...(wait !== undefined ? { wait } : {}),
-        ...(abandon !== undefined ? { abandon } : {}),
-      }),
+    ({ id, wait, abandon }, extra?: { signal?: AbortSignal }) =>
+      checkPendingCall(
+        {
+          ...(id !== undefined ? { id } : {}),
+          ...(wait !== undefined ? { wait } : {}),
+          ...(abandon !== undefined ? { abandon } : {}),
+        },
+        undefined,
+        extra?.signal,
+      ),
   );
 }
 

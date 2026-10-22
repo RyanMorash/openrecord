@@ -23,6 +23,10 @@ setLogSink((level, args) => {
  * user_config is required — all auth happens via the in-chat setup_account
  * tool, which uses MCP elicitation to deterministically collect each field
  * (instance picker → username + password → 2FA → passkey opt-in).
+ *
+ * `node dist/server.cjs --http` is the container entry. Same tools, Streamable
+ * HTTP on /mcp, bearer token required. Stdio stays the default so Claude
+ * Desktop's spawn line does not change.
  */
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -32,16 +36,10 @@ import { clearAllSessions } from './session-manager';
 import setupWidget from 'virtual:setup-widget';
 import { buildSetupUiHtml, SETUP_UI_MIME_TYPE, SETUP_UI_RESOURCE_META } from './ui';
 import { startDirectoryRefresh } from './directory-refresh';
+import { HTTP_PORT, startHttpServer } from './http';
+import { useHttpParkDeadline } from './pending-call';
 
-async function main(): Promise<void> {
-  const server = new McpServer(
-    {
-      name: 'openrecord',
-      version: '2.0.0',
-    },
-    {
-      capabilities: { tools: {}, resources: {} },
-      instructions:
+const INSTRUCTIONS =
         'OpenRecord connects this conversation to the user\'s MyChart patient portal. ' +
         '\n\n' +
         'EVERY data tool requires an `account` parameter — the MyChart hostname returned by ' +
@@ -80,21 +78,44 @@ async function main(): Promise<void> {
         '\n  5. Use the data tools (get_medications, get_lab_results, send_message, etc.) with the ' +
         '     `account` from the previous step.' +
         '\n\n' +
-        'Long tool calls: a call that has not answered after 2.5 minutes keeps running in the background ' +
-        'and returns a note carrying an id instead of its result; collect the result with ' +
-        'check_pending_call(id). Never repeat that call with the same arguments while it is pending — it ' +
-        'is already running and would be refused, and a tool that sends something would send it twice. ' +
-        'Other tools are unaffected, except switch_proxy_target on that account, which waits for the read.' +
+        'LONG_CALLS' +
         '\n\n' +
         'Public information (no account): get_hospital_info(hostname) returns what a MyChart ' +
         'instance publishes about its health system to anyone — support phone lines, the bookable ' +
         'provider directory with clinic addresses, and billing entities. Use search_mycharts to find ' +
         'the hostname first. It never returns a fax number or an accepted-insurance list; MyChart ' +
-        'does not publish those.',
+        'does not publish those.';
+
+const LONG_CALLS_STDIO =
+  'Long tool calls: a call that has not answered after 2.5 minutes keeps running in the background ' +
+  'and returns a note carrying an id instead of its result; collect the result with ' +
+  'check_pending_call(id). Never repeat that call with the same arguments while it is pending — it ' +
+  'is already running and would be refused, and a tool that sends something would send it twice. ' +
+  'Other tools are unaffected, except switch_proxy_target on that account, which waits for the read.';
+
+const LONG_CALLS_HTTP =
+  'Long tool calls: a call that has not answered after 1 minute keeps running in the background ' +
+  'and returns a note carrying an id instead of its result. That note is sent inside the minute, ' +
+  'before a proxy that closes a response around 100 seconds drops the connection. If that connection ' +
+  'drops before the note is sent, the call is still parked: list it with check_pending_call and no id. ' +
+  'Collect the result with check_pending_call(id). A collection waits at most 1 minute and leaves a result that is not ' +
+  'ready yet parked. If that collection\'s connection drops, the result stays parked under the same id, ' +
+  'including when the work finishes after the drop. An identical retry while it is pending joins ' +
+  'that same call instead of starting another, so a tool that sends something is not sent twice. ' +
+  'Other tools are unaffected, except switch_proxy_target on that ' +
+  'account, which waits for the read.';
+
+function createMcpServer(mode: 'stdio' | 'http'): McpServer {
+  const server = new McpServer(
+    {
+      name: 'openrecord',
+      version: '2.0.0',
+    },
+    {
+      capabilities: { tools: {}, resources: {} },
+      instructions: INSTRUCTIONS.replace('LONG_CALLS', mode === 'http' ? LONG_CALLS_HTTP : LONG_CALLS_STDIO),
     },
   );
-
-  // ── Resources ─────────────────────────────────────────────────────────────
 
   // Serve the interactive setup widget HTML.
   const setupHtml = buildSetupUiHtml(setupWidget);
@@ -119,7 +140,35 @@ async function main(): Promise<void> {
   );
 
   registerAllTools(server);
+  return server;
+}
 
+async function main(): Promise<void> {
+  if (process.argv.includes('--http')) {
+    const token = process.env.OPENRECORD_MCP_TOKEN?.trim() ?? '';
+    if (!token) {
+      console.error('[openrecord] OPENRECORD_MCP_TOKEN is required for --http');
+      process.exit(1);
+    }
+    useHttpParkDeadline();
+    const listening = await startHttpServer({
+      token,
+      port: HTTP_PORT,
+      createServer: () => createMcpServer('http'),
+    });
+    startDirectoryRefresh();
+    // Stdio exits when the parent closes stdin. A container has no parent pipe;
+    // that handler would shut the server down as soon as it started.
+    const shutdown = () => {
+      clearAllSessions();
+      void listening.close().finally(() => process.exit(0));
+    };
+    process.on('SIGINT', shutdown);
+    process.on('SIGTERM', shutdown);
+    return;
+  }
+
+  const server = createMcpServer('stdio');
   const transport = new StdioServerTransport();
   await server.connect(transport);
   startDirectoryRefresh();

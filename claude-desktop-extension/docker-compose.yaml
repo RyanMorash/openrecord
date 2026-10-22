@@ -1,0 +1,19 @@
+# One replica. Pending 2FA, parked tool calls, and the live MyChart session
+# are in this process; a second copy would not see them.
+services:
+  openrecord:
+    build:
+      context: ..
+      dockerfile: claude-desktop-extension/Dockerfile
+    # Localhost only. A tunnel or proxy on this machine is what the portal
+    # reaches. Publishing on every interface would expose the raw HTTP port.
+    ports:
+      - "127.0.0.1:8787:8787"
+    environment:
+      OPENRECORD_MCP_TOKEN: ${OPENRECORD_MCP_TOKEN:?Set OPENRECORD_MCP_TOKEN}
+    volumes:
+      - openrecord-mcpb:/data
+    restart: unless-stopped
+
+volumes:
+  openrecord-mcpb:

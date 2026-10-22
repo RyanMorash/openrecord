@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, setSystemTime } from 'bun:
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { CAPABILITIES } from '../../../shared/capabilities';
-import { CHECK_TOOL, MAX_RUN_MS, checkPendingCall, resetPendingCalls, runGuarded, unsettledCallOnAccount } from '../pending-call';
+import { CHECK_TOOL, MAX_RUN_MS, checkPendingCall, resetPendingCalls, runGuarded, unsettledCallOnAccount, useDesktopParkDeadline, useHttpParkDeadline, withLostResponse, withResponseDelivery } from '../pending-call';
 
 const ok = (text: string): CallToolResult => ({ content: [{ type: 'text', text }] });
 const text = (r: CallToolResult): string => (r.content[0] as { text: string }).text;
@@ -27,7 +27,10 @@ function deferred() {
 }
 const ACCOUNT = { account: 'homer@mychart.example.org' };
 
-beforeEach(() => resetPendingCalls());
+beforeEach(() => {
+  resetPendingCalls();
+  useDesktopParkDeadline();
+});
 afterEach(() => setSystemTime());
 
 describe('runGuarded', () => {
@@ -165,6 +168,18 @@ describe('checkPendingCall', () => {
     expect(unsettledCallOnAccount(ACCOUNT.account)).toBeUndefined();
   });
 
+  it('discards a result abandoned while its collection is waiting', async () => {
+    const d = deferred();
+    const id = idOf(await runGuarded('get_billing', ACCOUNT, d.fn, 5));
+    const waiting = checkPendingCall({ id }, 5_000);
+    await tick();
+    await checkPendingCall({ id, abandon: true });
+    d.resolve(ok('bills'));
+    const done = text(await waiting);
+    expect(done).toContain('its result was discarded');
+    expect(done).not.toContain('bills');
+  });
+
   it('releases the chart lock at the cap even when the scrape never settles', async () => {
     // A scrape that never resolves used to hold switch_proxy_target for the
     // life of the process, with check_pending_call calling the same id gone.
@@ -187,6 +202,205 @@ describe('checkPendingCall', () => {
     expect([r.isError, text(r)]).toEqual([true, expect.stringContaining('Gave up on get_billing')]);
     expect(await runGuarded('get_billing', ACCOUNT, () => ok('fresh'), 50)).toEqual(ok('fresh'));
     d.resolve(ok('bills'));
+  });
+});
+
+describe('http park deadline', () => {
+  it('parks inside the proxy window and keeps a result the timed-out collection did not return', async () => {
+    useHttpParkDeadline(30);
+    const d = deferred();
+    const started = Date.now();
+    const parked = await runGuarded('get_profile', ACCOUNT, d.fn);
+    const id = idOf(parked);
+    expect(Date.now() - started).toBeLessThan(500);
+    expect(text(parked)).toContain('is still running after 1 minute');
+
+    // The collection wait is the same short deadline. Nothing is ready, so the
+    // entry stays: a later call still receives the result.
+    expect(text(await checkPendingCall({ id }))).toContain('is still running');
+
+    d.resolve(ok('profile'));
+    await tick();
+    expect(await checkPendingCall({ id })).toEqual(ok('profile'));
+  });
+
+  it('keeps a result that arrives after the collection is aborted', async () => {
+    const d = deferred();
+    const id = idOf(await runGuarded('get_profile', ACCOUNT, d.fn, 5));
+    const ac = new AbortController();
+    const waiting = checkPendingCall({ id }, 5_000, ac.signal);
+    await tick();
+    ac.abort();
+    d.resolve(ok('profile'));
+    await tick();
+    expect(text(await waiting)).toContain('is still running');
+    expect(await checkPendingCall({ id, wait: false })).toEqual(ok('profile'));
+  });
+
+  it('runs an identical in-flight HTTP call once and shares the result', async () => {
+    const d = deferred();
+    let runs = 0;
+    const run = (): Promise<CallToolResult> => {
+      runs += 1;
+      return d.fn();
+    };
+    const owner = withLostResponse(new AbortController().signal, () => runGuarded('send_message', ACCOUNT, run, 5_000));
+    await tick();
+    const joiner = withLostResponse(new AbortController().signal, () => runGuarded('send_message', ACCOUNT, run, 5_000));
+    await tick();
+    expect(runs).toBe(1);
+    d.resolve(ok('once'));
+    expect(await owner).toEqual(ok('once'));
+    expect(await joiner).toEqual(ok('once'));
+    expect(await withLostResponse(new AbortController().signal, () => runGuarded('send_message', ACCOUNT, () => ok('fresh'), 50))).toEqual(ok('fresh'));
+    expect(runs).toBe(1);
+  });
+
+  it('leaves the result parked when both HTTP callers disconnect', async () => {
+    const d = deferred();
+    let runs = 0;
+    const run = (): Promise<CallToolResult> => {
+      runs += 1;
+      return d.fn();
+    };
+    const ownerStop = new AbortController();
+    const joinerStop = new AbortController();
+    const owner = withLostResponse(ownerStop.signal, () => runGuarded('send_message', ACCOUNT, run, 5_000));
+    await tick();
+    const joiner = withLostResponse(joinerStop.signal, () => runGuarded('send_message', ACCOUNT, run, 5_000));
+    await tick();
+    ownerStop.abort();
+    joinerStop.abort();
+    d.resolve(ok('sent'));
+    await tick();
+    expect(runs).toBe(1);
+    const ownerNote = await owner;
+    const joinerNote = await joiner;
+    expect(text(ownerNote)).toContain('is still running');
+    expect(idOf(joinerNote)).toBe(idOf(ownerNote));
+    expect(await checkPendingCall({ id: idOf(ownerNote), wait: false })).toEqual(ok('sent'));
+  });
+
+  it('does not park again after a joined caller already received the result', async () => {
+    const d = deferred();
+    let runs = 0;
+    const run = (): Promise<CallToolResult> => {
+      runs += 1;
+      return d.fn();
+    };
+    const ownerStop = new AbortController();
+    const owner = withLostResponse(ownerStop.signal, () => runGuarded('send_message', ACCOUNT, run, 5_000));
+    await tick();
+    const joiner = withLostResponse(new AbortController().signal, () => runGuarded('send_message', ACCOUNT, run, 5_000));
+    await tick();
+    ownerStop.abort();
+    d.resolve(ok('sent'));
+    expect(await joiner).toEqual(ok('sent'));
+    await owner;
+    expect(runs).toBe(1);
+    expect(await withLostResponse(new AbortController().signal, () => runGuarded('send_message', ACCOUNT, () => ok('fresh'), 50))).toEqual(ok('fresh'));
+  });
+
+  it('discards the result when an HTTP call is abandoned while its callers are waiting', async () => {
+    const d = deferred();
+    let runs = 0;
+    const run = (): Promise<CallToolResult> => {
+      runs += 1;
+      return d.fn();
+    };
+    const owner = withLostResponse(new AbortController().signal, () => runGuarded('send_message', ACCOUNT, run, 5_000));
+    await tick();
+    const joiner = withLostResponse(new AbortController().signal, () => runGuarded('send_message', ACCOUNT, run, 5_000));
+    await tick();
+    expect(runs).toBe(1);
+    const id = idOf(await checkPendingCall({}));
+    expect(text(await checkPendingCall({ id, abandon: true }))).toContain('already sent still lands');
+    d.resolve(ok('sent'));
+    const ownerText = text(await owner);
+    const joinerText = text(await joiner);
+    expect(ownerText).toContain('its result was discarded');
+    expect(ownerText).not.toContain('sent');
+    expect(joinerText).toContain('its result was discarded');
+    expect(runs).toBe(1);
+  });
+
+  it('clips an HTTP retry to the time left before the 10-minute cap', async () => {
+    const d = deferred();
+    const owner = await withLostResponse(new AbortController().signal, () => runGuarded('get_billing', ACCOUNT, d.fn, 5));
+    const id = idOf(owner);
+    setSystemTime(new Date(Date.now() + MAX_RUN_MS - 10));
+    const retry = await withLostResponse(new AbortController().signal, () =>
+      runGuarded('get_billing', ACCOUNT, () => ok('late'), 60_000),
+    );
+    expect([retry.isError, text(retry)]).toEqual([true, expect.stringContaining('Gave up on get_billing')]);
+    d.resolve(ok('bills'));
+    await tick();
+    expect((await checkPendingCall({ id, wait: false })).isError).toBe(true);
+  });
+
+  it('still returns a result that arrives inside the time left before the cap', async () => {
+    const d = deferred();
+    await withLostResponse(new AbortController().signal, () => runGuarded('get_billing', ACCOUNT, d.fn, 5));
+    setSystemTime(new Date(Date.now() + MAX_RUN_MS - 5_000));
+    const retry = withLostResponse(new AbortController().signal, () => runGuarded('get_billing', ACCOUNT, () => ok('late'), 60_000));
+    await tick();
+    d.resolve(ok('bills'));
+    expect(await retry).toEqual(ok('bills'));
+  });
+
+  it('gives a finished result to one collector until that response finishes', async () => {
+    const d = deferred();
+    const id = idOf(await runGuarded('send_message', ACCOUNT, d.fn, 5));
+    d.resolve(ok('sent'));
+    await tick();
+    let report: ((wrote: boolean) => void) | undefined;
+    const first = withResponseDelivery(
+      (cb) => {
+        report = cb;
+      },
+      () => checkPendingCall({ id, wait: false }),
+    );
+    await tick();
+    const second = await withResponseDelivery(
+      () => {
+        throw new Error('second collector must not claim the result');
+      },
+      () => checkPendingCall({ id, wait: false }),
+    );
+    expect(await first).toEqual(ok('sent'));
+    expect(text(second)).toContain('already being returned');
+    report?.(false);
+    expect(await checkPendingCall({ id, wait: false })).toEqual(ok('sent'));
+  });
+
+  it('forgets a claimed result once its response finishes', async () => {
+    const d = deferred();
+    const id = idOf(await runGuarded('send_message', ACCOUNT, d.fn, 5));
+    d.resolve(ok('sent'));
+    await tick();
+    let report: ((wrote: boolean) => void) | undefined;
+    const first = withResponseDelivery(
+      (cb) => {
+        report = cb;
+      },
+      () => checkPendingCall({ id, wait: false }),
+    );
+    expect(await first).toEqual(ok('sent'));
+    report?.(true);
+    expect(text(await checkPendingCall({ id, wait: false }))).toContain('was collected');
+  });
+
+  it('parks a finished call when the original request is aborted', async () => {
+    const d = deferred();
+    const ac = new AbortController();
+    const waiting = runGuarded('send_message', ACCOUNT, d.fn, 5_000, ac.signal);
+    await tick();
+    ac.abort();
+    d.resolve(ok('sent'));
+    await tick();
+    const parked = await waiting;
+    expect(text(parked)).toContain('is still running');
+    expect(await checkPendingCall({ id: idOf(parked), wait: false })).toEqual(ok('sent'));
   });
 });
 
@@ -215,5 +429,30 @@ describe('registered through the server', () => {
     d.resolve(ok('bills'));
     await tick();
     expect(await tools.get(CHECK_TOOL)!({ id })).toEqual(ok('bills'));
+  });
+
+  it('an HTTP switch does not refuse its own reservation, and still waits for another read', async () => {
+    const { registerAllTools } = await import('../tools');
+    const tools = new Map<string, Handler>();
+    registerAllTools({
+      registerTool: (name: string, _config: unknown, handler: Handler) => {
+        tools.set(name, handler);
+      },
+    } as unknown as McpServer);
+
+    const alone = await withLostResponse(new AbortController().signal, () =>
+      tools.get('switch_proxy_target')!({ ...ACCOUNT, patient: 'bart' }),
+    );
+    expect(text(alone)).not.toContain('still reading');
+
+    const d = deferred();
+    const read = withLostResponse(new AbortController().signal, () => runGuarded('get_billing', ACCOUNT, d.fn, 5_000));
+    await tick();
+    const blocked = await withLostResponse(new AbortController().signal, () =>
+      tools.get('switch_proxy_target')!({ ...ACCOUNT, patient: 'bart' }),
+    );
+    expect(text(blocked)).toContain(`get_billing (id "${idOf(await checkPendingCall({}))}") is still reading`);
+    d.resolve(ok('bills'));
+    await read;
   });
 });

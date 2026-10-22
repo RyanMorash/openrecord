@@ -102,6 +102,32 @@ function installDroppedEnd(): { arm: () => void; restore: () => void } {
   };
 }
 
+/**
+ * The real `end` runs after the socket is already destroyed. `writableEnded` is
+ * then true and `finish` does not fire — the same window as a socket write that
+ * never completes. Stubbing `socket.write` cannot reproduce that under Bun.
+ */
+function installEndWithoutFinish(): { arm: () => void; restore: () => void } {
+  // eslint-disable-next-line @typescript-eslint/unbound-method
+  const originalEnd = ServerResponse.prototype.end;
+  let armed = false;
+  ServerResponse.prototype.end = function (this: ServerResponse, ...args: never[]) {
+    if (!armed) return originalEnd.apply(this, args as unknown as [chunk: unknown, encoding: BufferEncoding, cb?: () => void]);
+    armed = false;
+    this.socket?.destroy();
+    this.req?.socket?.destroy();
+    return originalEnd.apply(this, args as unknown as [chunk: unknown, encoding: BufferEncoding, cb?: () => void]);
+  } as typeof originalEnd;
+  return {
+    arm: () => {
+      armed = true;
+    },
+    restore: () => {
+      ServerResponse.prototype.end = originalEnd;
+    },
+  };
+}
+
 function bareServer(): McpServer {
   return new McpServer({ name: 'openrecord-test', version: '0.0.0' });
 }
@@ -426,6 +452,48 @@ describe('startHttpServer', () => {
       expect(runs).toBe(1);
     } finally {
       dropped.restore();
+    }
+  });
+
+  it('keeps a result when end() runs but the socket write never finishes', async () => {
+    let runs = 0;
+    const stalled = installEndWithoutFinish();
+    try {
+      listening = await startHttpServer({
+        token: TOKEN,
+        port: 0,
+        createServer: () => {
+          const mcp = new McpServer({ name: 'openrecord-test', version: '0.0.0' });
+          mcp.registerTool('slow_read', { description: 'test', inputSchema: {} }, () =>
+            runGuarded('slow_read', {}, () => {
+              runs += 1;
+              return { content: [{ type: 'text', text: 'sent' }] };
+            }, 5_000),
+          );
+          return mcp;
+        },
+      });
+      const url = `http://127.0.0.1:${listening.port}/mcp`;
+      const sessionId = await initialize(url);
+      const headers = { ...mcpHeaders, 'mcp-session-id': sessionId, 'mcp-protocol-version': '2025-06-18' };
+      const call = (id: number, signal?: AbortSignal) =>
+        fetch(url, {
+          method: 'POST',
+          headers,
+          ...(signal ? { signal } : {}),
+          body: JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/call', params: { name: 'slow_read', arguments: {} } }),
+        });
+
+      stalled.arm();
+      await call(2, AbortSignal.timeout(800)).then((res) => res.text()).catch(() => undefined);
+      expect(runs).toBe(1);
+
+      const again = await call(3);
+      expect(again.status).toBe(200);
+      expect(toolText(await readRpc(again))).toBe('sent');
+      expect(runs).toBe(1);
+    } finally {
+      stalled.restore();
     }
   });
 

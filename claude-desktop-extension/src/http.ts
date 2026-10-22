@@ -63,31 +63,32 @@ function endEmpty(req: IncomingMessage, res: ServerResponse, status: number): vo
 
 /**
  * A proxy drops the socket without `notifications/cancelled`, which is the
- * only abort the SDK raises on its own. Closing before the response was ended
- * is that drop.
+ * only abort the SDK raises on its own. `end()` sets `writableEnded` before the
+ * buffered bytes are written, and `writableFinished` can already be true then
+ * too, so neither flag means the client can have the body. The `finish` event
+ * does: it is withheld when the socket write never completes.
  */
 function handleOnTransport(transport: StreamableHTTPServerTransport, req: IncomingMessage, res: ServerResponse): Promise<void> {
   const lost = new AbortController();
   const waiters: Array<(wrote: boolean) => void> = [];
-  let settled = false;
-  const finish = (wrote: boolean): void => {
-    if (settled) return;
-    settled = true;
+  let outcome: boolean | undefined;
+  const complete = (wrote: boolean): void => {
+    if (outcome !== undefined) return;
+    outcome = wrote;
+    res.off('finish', onFinish);
     res.off('close', onClose);
     if (!wrote) lost.abort();
     for (const waiter of waiters.splice(0)) waiter(wrote);
   };
-  const onClose = (): void => finish(res.writableEnded);
+  const onFinish = (): void => complete(true);
+  const onClose = (): void => complete(false);
+  res.on('finish', onFinish);
   res.on('close', onClose);
-  // `end()` may already have run when handleRequest resolves. `close` can still be queued,
-  // so a response that has ended is delivered even if that event has not fired.
   const notify = (cb: (wrote: boolean) => void): void => {
-    if (settled) cb(res.writableEnded);
+    if (outcome !== undefined) cb(outcome);
     else waiters.push(cb);
   };
-  return withResponseDelivery(notify, () => withLostResponse(lost.signal, () => transport.handleRequest(req, res))).finally(() => {
-    if (res.writableEnded) finish(true);
-  });
+  return withResponseDelivery(notify, () => withLostResponse(lost.signal, () => transport.handleRequest(req, res)));
 }
 
 function jsonError(req: IncomingMessage, res: ServerResponse, status: number, message: string): void {

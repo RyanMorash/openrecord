@@ -18,7 +18,7 @@
  * connection the proxy had already closed. One minute is inside that window
  * for both the park note and a collection wait. A disconnect before that
  * minute is the same hole, so an aborted wait parks instead of returning.
- * A finished HTTP result stays reserved until that response has ended, and
+ * A finished HTTP result stays reserved until that response finishes writing, and
  * abandoning the call while its request is still waiting returns a discard
  * note instead of the payload. Desktop is unchanged.
  *
@@ -255,9 +255,9 @@ function discardFinished(entry: Parked): CallToolResult {
 }
 
 /**
- * Forget a result a caller is about to receive. On HTTP that waits until the response has ended:
- * the handler returning is not the client having the bytes, and a socket that closes first must
- * leave the result parked so a retry does not run the tool again.
+ * Forget a result a caller is about to receive. On HTTP that waits until the response finishes
+ * writing. `end()` returning is not the client having the bytes, and a socket that closes first
+ * must leave the result parked so a retry does not run the tool again.
  */
 function releaseIfWritten(entry: Parked, why: string): void {
   const forgetWritten = (wrote: boolean): void => {

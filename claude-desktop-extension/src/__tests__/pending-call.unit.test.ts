@@ -224,6 +224,19 @@ describe('http park deadline', () => {
     expect(text(await waiting)).toContain('is still running');
     expect(await checkPendingCall({ id, wait: false })).toEqual(ok('profile'));
   });
+
+  it('parks a finished call when the original request is aborted', async () => {
+    const d = deferred();
+    const ac = new AbortController();
+    const waiting = runGuarded('send_message', ACCOUNT, d.fn, 5_000, ac.signal);
+    await tick();
+    ac.abort();
+    d.resolve(ok('sent'));
+    await tick();
+    const parked = await waiting;
+    expect(text(parked)).toContain('is still running');
+    expect(await checkPendingCall({ id: idOf(parked), wait: false })).toEqual(ok('sent'));
+  });
 });
 
 describe('registered through the server', () => {

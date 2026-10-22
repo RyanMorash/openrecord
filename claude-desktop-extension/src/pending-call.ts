@@ -16,7 +16,9 @@
  * to take the direct-return branch and never enter this map, and a collection
  * that waited the full desktop deadline could discard a result onto a
  * connection the proxy had already closed. One minute is inside that window
- * for both the park note and a collection wait. Desktop is unchanged.
+ * for both the park note and a collection wait. A disconnect before that
+ * minute is the same hole, so an aborted wait parks instead of returning.
+ * Desktop is unchanged.
  *
  * Calls are not serialized — the same log shows Claude Desktop issuing a
  * second call 5.5 s after an unanswered first — so several may park. A
@@ -85,9 +87,15 @@ interface Parked {
 const parked = new Map<string, Parked>();
 /** Collections blocked inside the wait. The disconnect test waits until this is non-zero. */
 let waitingCollections = 0;
+/** Original tool calls blocked inside their first wait. The disconnect test waits until this is non-zero. */
+let waitingGuards = 0;
 
 export function collectionWaitsInFlight(): number {
   return waitingCollections;
+}
+
+export function guardedWaitsInFlight(): number {
+  return waitingGuards;
 }
 
 /**
@@ -219,6 +227,7 @@ export async function runGuarded(
   args: Record<string, unknown>,
   fn: () => CallToolResult | Promise<CallToolResult>,
   deadlineMs = parkDeadlineMs,
+  signal?: AbortSignal,
 ): Promise<CallToolResult> {
   const now = Date.now();
   sweep(now);
@@ -232,8 +241,19 @@ export async function runGuarded(
   const promise = Promise.resolve()
     .then(fn)
     .catch((err: unknown) => text(`Error: ${(err as Error).message}`, true));
-  const result = await settleWithin(promise, deadlineMs);
-  if (result) return result;
+  const linked = linkSignals(signal, lostResponse.getStore());
+  const stop = linked.signal;
+  let result: CallToolResult | undefined;
+  waitingGuards += 1;
+  try {
+    result = await settleWithin(promise, deadlineMs, stop);
+  } finally {
+    waitingGuards -= 1;
+    linked.stop();
+  }
+  // A disconnect during this wait must not take the direct return. The bytes
+  // would go nowhere, the call would not be parked, and a retry could send twice.
+  if (result && !stop?.aborted) return result;
 
   const account = typeof args.account === 'string' ? args.account.trim().toLowerCase() : null;
   const entry: Parked = { id: randomUUID(), tool, key, account, startedAt: now, promise };
@@ -344,4 +364,5 @@ export function resetPendingCalls(): void {
   parked.clear();
   gone.clear();
   waitingCollections = 0;
+  waitingGuards = 0;
 }

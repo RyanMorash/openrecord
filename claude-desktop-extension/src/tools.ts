@@ -614,9 +614,10 @@ async function connectWithPassword(hostname: string, username: string, password:
  */
 function guarded(server: McpServer): McpServer {
   const registerTool = (name: string, config: unknown, handler: (...a: unknown[]) => ToolResult | Promise<ToolResult>) =>
-    server.registerTool(name, config as never, (...a: unknown[]) =>
-      runGuarded(name, (a[0] ?? {}) as Record<string, unknown>, () => handler(...a)),
-    );
+    server.registerTool(name, config as never, (...a: unknown[]) => {
+      const extra = a[1] as { signal?: AbortSignal } | undefined;
+      return runGuarded(name, (a[0] ?? {}) as Record<string, unknown>, () => handler(...a), undefined, extra?.signal);
+    });
   return { registerTool } as unknown as McpServer;
 }
 

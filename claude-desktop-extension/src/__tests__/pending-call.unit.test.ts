@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, setSystemTime } from 'bun:
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { CAPABILITIES } from '../../../shared/capabilities';
-import { CHECK_TOOL, MAX_RUN_MS, checkPendingCall, resetPendingCalls, runGuarded, unsettledCallOnAccount, useDesktopParkDeadline, useHttpParkDeadline, withLostResponse } from '../pending-call';
+import { CHECK_TOOL, MAX_RUN_MS, checkPendingCall, resetPendingCalls, runGuarded, unsettledCallOnAccount, useDesktopParkDeadline, useHttpParkDeadline, withLostResponse, withResponseDelivery } from '../pending-call';
 
 const ok = (text: string): CallToolResult => ({ content: [{ type: 'text', text }] });
 const text = (r: CallToolResult): string => (r.content[0] as { text: string }).text;
@@ -322,6 +322,72 @@ describe('http park deadline', () => {
     expect(ownerText).not.toContain('sent');
     expect(joinerText).toContain('its result was discarded');
     expect(runs).toBe(1);
+  });
+
+  it('clips an HTTP retry to the time left before the 10-minute cap', async () => {
+    const d = deferred();
+    const owner = await withLostResponse(new AbortController().signal, () => runGuarded('get_billing', ACCOUNT, d.fn, 5));
+    const id = idOf(owner);
+    setSystemTime(new Date(Date.now() + MAX_RUN_MS - 10));
+    const retry = await withLostResponse(new AbortController().signal, () =>
+      runGuarded('get_billing', ACCOUNT, () => ok('late'), 60_000),
+    );
+    expect([retry.isError, text(retry)]).toEqual([true, expect.stringContaining('Gave up on get_billing')]);
+    d.resolve(ok('bills'));
+    await tick();
+    expect((await checkPendingCall({ id, wait: false })).isError).toBe(true);
+  });
+
+  it('still returns a result that arrives inside the time left before the cap', async () => {
+    const d = deferred();
+    await withLostResponse(new AbortController().signal, () => runGuarded('get_billing', ACCOUNT, d.fn, 5));
+    setSystemTime(new Date(Date.now() + MAX_RUN_MS - 5_000));
+    const retry = withLostResponse(new AbortController().signal, () => runGuarded('get_billing', ACCOUNT, () => ok('late'), 60_000));
+    await tick();
+    d.resolve(ok('bills'));
+    expect(await retry).toEqual(ok('bills'));
+  });
+
+  it('gives a finished result to one collector until that response finishes', async () => {
+    const d = deferred();
+    const id = idOf(await runGuarded('send_message', ACCOUNT, d.fn, 5));
+    d.resolve(ok('sent'));
+    await tick();
+    let report: ((wrote: boolean) => void) | undefined;
+    const first = withResponseDelivery(
+      (cb) => {
+        report = cb;
+      },
+      () => checkPendingCall({ id, wait: false }),
+    );
+    await tick();
+    const second = await withResponseDelivery(
+      () => {
+        throw new Error('second collector must not claim the result');
+      },
+      () => checkPendingCall({ id, wait: false }),
+    );
+    expect(await first).toEqual(ok('sent'));
+    expect(text(second)).toContain('already being returned');
+    report?.(false);
+    expect(await checkPendingCall({ id, wait: false })).toEqual(ok('sent'));
+  });
+
+  it('forgets a claimed result once its response finishes', async () => {
+    const d = deferred();
+    const id = idOf(await runGuarded('send_message', ACCOUNT, d.fn, 5));
+    d.resolve(ok('sent'));
+    await tick();
+    let report: ((wrote: boolean) => void) | undefined;
+    const first = withResponseDelivery(
+      (cb) => {
+        report = cb;
+      },
+      () => checkPendingCall({ id, wait: false }),
+    );
+    expect(await first).toEqual(ok('sent'));
+    report?.(true);
+    expect(text(await checkPendingCall({ id, wait: false }))).toContain('was collected');
   });
 
   it('parks a finished call when the original request is aborted', async () => {

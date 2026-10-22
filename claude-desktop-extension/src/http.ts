@@ -68,7 +68,12 @@ function endEmpty(req: IncomingMessage, res: ServerResponse, status: number): vo
  * too, so neither flag means the client can have the body. The `finish` event
  * does: it is withheld when the socket write never completes.
  */
-function handleOnTransport(transport: StreamableHTTPServerTransport, req: IncomingMessage, res: ServerResponse): Promise<void> {
+function handleOnTransport(
+  transport: StreamableHTTPServerTransport,
+  req: IncomingMessage,
+  res: ServerResponse,
+  parsedBody?: unknown,
+): Promise<void> {
   const lost = new AbortController();
   const waiters: Array<(wrote: boolean) => void> = [];
   let outcome: boolean | undefined;
@@ -88,7 +93,64 @@ function handleOnTransport(transport: StreamableHTTPServerTransport, req: Incomi
     if (outcome !== undefined) cb(outcome);
     else waiters.push(cb);
   };
-  return withResponseDelivery(notify, () => withLostResponse(lost.signal, () => transport.handleRequest(req, res)));
+  return withResponseDelivery(notify, () =>
+    withLostResponse(lost.signal, () =>
+      parsedBody !== undefined ? transport.handleRequest(req, res, parsedBody) : transport.handleRequest(req, res),
+    ),
+  );
+}
+
+/** A full session map reads this before closing anyone, so the read has a bound. */
+const MAX_INIT_BODY = 1024 * 1024;
+
+function isInitialize(value: unknown): boolean {
+  return !!value && typeof value === 'object' && (value as { method?: unknown }).method === 'initialize';
+}
+
+function readBody(req: IncomingMessage): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let total = 0;
+    const fail = (err: Error): void => {
+      req.off('data', onData);
+      req.off('end', onEnd);
+      req.off('error', onError);
+      reject(err);
+    };
+    const onData = (chunk: Buffer): void => {
+      total += chunk.length;
+      if (total > MAX_INIT_BODY) {
+        fail(new Error('initialize body exceeds 1MB'));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    };
+    const onEnd = (): void => resolve(Buffer.concat(chunks));
+    const onError = (err: Error): void => fail(err);
+    req.on('data', onData);
+    req.on('end', onEnd);
+    req.on('error', onError);
+  });
+}
+
+/**
+ * The body was already consumed. Hono's listener misses `end` if it subscribes
+ * after that, and then tries to drain a finished request when the response ends.
+ */
+function deliverLateEnd(req: IncomingMessage): void {
+  if (!req.readableEnded) return;
+  const on = req.on.bind(req);
+  const once = req.once.bind(req);
+  const wrap =
+    (register: typeof on) =>
+    function (this: IncomingMessage, event: string, listener: (...args: unknown[]) => void) {
+      const registered = register.call(this, event, listener as never);
+      if (event === 'end') listener();
+      return registered;
+    };
+  req.on = wrap(on) as typeof req.on;
+  req.once = wrap(once) as typeof req.once;
 }
 
 function jsonError(req: IncomingMessage, res: ServerResponse, status: number, message: string): void {
@@ -144,6 +206,24 @@ export function startHttpServer(options: {
   }
 
   async function openSession(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    // Closing an idle session is how a new client gets a slot. A body that is
+    // not initialize must not be able to do that.
+    let parsedBody: unknown;
+    if (sessions.size + pendingInits >= maxSessions) {
+      let raw: unknown;
+      try {
+        raw = JSON.parse((await readBody(req)).toString('utf8')) as unknown;
+      } catch {
+        if (!res.headersSent) jsonError(req, res, 400, 'Expected an initialize request');
+        return;
+      }
+      if (!isInitialize(raw)) {
+        jsonError(req, res, 400, 'Expected an initialize request');
+        return;
+      }
+      deliverLateEnd(req);
+      parsedBody = raw;
+    }
     if (!makeRoom()) {
       jsonError(req, res, 503, 'Too many MCP sessions');
       return;
@@ -177,7 +257,7 @@ export function startHttpServer(options: {
       // exactOptionalPropertyTypes that is not a Transport, whose callback is
       // optional but never explicitly undefined.
       await mcp.connect(transport as Transport);
-      await handleOnTransport(transport, req, res);
+      await handleOnTransport(transport, req, res, parsedBody);
     } finally {
       releaseReservation();
       const id = transport?.sessionId;

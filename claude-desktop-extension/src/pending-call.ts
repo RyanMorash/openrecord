@@ -98,6 +98,8 @@ interface Parked {
   settledAt?: number;
   /** A connected caller already received this result. A disconnected owner must not park it again. */
   delivered?: boolean;
+  /** Responses currently carrying this finished result. A second collector does not take it while this is set. */
+  outgoing?: number;
   /** The caller stopped waiting, so the result is no longer theirs. The entry stays until the scrape settles, or the cap, so the proxy guard still sees it. */
   abandoned?: boolean;
 }
@@ -247,6 +249,14 @@ function parkNote(tool: string, id: string): string {
   );
 }
 
+function gaveUp(entry: Parked): CallToolResult {
+  forget(entry, 'given up on after running 10 minutes');
+  return text(
+    `Gave up on ${entry.tool} after 10 minutes. Its result is discarded and this account is no longer held. ${ABANDON_MEANS}`,
+    true,
+  );
+}
+
 /** The result was abandoned while a caller was still waiting. They get the discard note, not the payload. */
 function discardFinished(entry: Parked): CallToolResult {
   forget(entry, 'abandoned, and its result discarded when it finished');
@@ -257,11 +267,17 @@ function discardFinished(entry: Parked): CallToolResult {
 /**
  * Forget a result a caller is about to receive. On HTTP that waits until the response finishes
  * writing. `end()` returning is not the client having the bytes, and a socket that closes first
- * must leave the result parked so a retry does not run the tool again.
+ * must leave the result parked so a retry does not run the tool again. The count is what stops a
+ * second collector from taking the same payload while the first response is still open.
  */
 function releaseIfWritten(entry: Parked, why: string): void {
+  entry.outgoing = (entry.outgoing ?? 0) + 1;
   const forgetWritten = (wrote: boolean): void => {
-    if (!wrote || !parked.has(entry.id)) return;
+    if (!parked.has(entry.id)) return;
+    if (!wrote) {
+      entry.outgoing = Math.max(0, (entry.outgoing ?? 1) - 1);
+      return;
+    }
     if (entry.abandoned) {
       forget(entry, 'abandoned, and its result discarded when it finished');
       return;
@@ -282,13 +298,27 @@ async function joinParked(entry: Parked, deadlineMs: number, signal?: AbortSigna
   const linked = linkSignals(signal, lostResponse.getStore());
   const stop = linked.signal;
   let result = entry.result;
+  // A retry near the cap must not wait a fresh full deadline. That wait can
+  // outlive the sweep that already released the chart.
+  const remaining = MAX_RUN_MS - (Date.now() - entry.startedAt);
+  const clipped = remaining <= deadlineMs;
   waitingGuards += 1;
   try {
-    if (result === undefined && !stop?.aborted) result = await settleWithin(entry.promise, deadlineMs, stop);
+    if (result === undefined && !stop?.aborted) {
+      result = await settleWithin(entry.promise, clipped ? Math.max(0, remaining) : deadlineMs, stop);
+    }
   } finally {
     waitingGuards -= 1;
     linked.stop();
   }
+  if (!parked.has(entry.id)) {
+    // The owner can finish the shared delivery, or abandon it, before this retry resumes.
+    if (entry.abandoned) return discardFinished(entry);
+    if (entry.delivered && result) return result;
+    const why = gone.get(entry.id) ?? 'no call with that id was parked here';
+    return text(`No pending call has id "${entry.id}": ${why}, and it is holding nothing.`, true);
+  }
+  if (result === undefined && clipped) return gaveUp(entry);
   if (stop?.aborted || !result) return stillRunning(parkNote(entry.tool, entry.id), entry.id);
   if (entry.abandoned) return discardFinished(entry);
   releaseIfWritten(entry, 'collected');
@@ -449,13 +479,17 @@ export async function checkPendingCall(
       // Read after the wait. Abandon can land while this collection is blocked,
       // and the flag from before the wait would still hand over the payload.
       if (p.abandoned) return discardFinished(p);
+      // Claimed before this function returns, so a second check cannot pass the
+      // same test while this response is still being written.
+      if ((p.outgoing ?? 0) > 0) {
+        return text(
+          `${p.tool} (id "${id}") has finished, and that result is already being returned on another request. Call ${CHECK_TOOL} again if that request does not finish.`,
+        );
+      }
       releaseIfWritten(p, 'collected');
       return result;
     }
-    if (wait !== false && clipped) {
-      forget(p, 'given up on after running 10 minutes');
-      return text(`Gave up on ${p.tool} after 10 minutes. Its result is discarded and this account is no longer held. ${ABANDON_MEANS}`, true);
-    }
+    if (wait !== false && clipped) return gaveUp(p);
     const how = p.abandoned
       ? `Its result will be discarded, because it was abandoned. Call ${CHECK_TOOL} again to wait for the account to come free.`
       : `Call ${CHECK_TOOL} again to keep waiting, or with abandon: true to stop waiting. ${ABANDON_MEANS}`;

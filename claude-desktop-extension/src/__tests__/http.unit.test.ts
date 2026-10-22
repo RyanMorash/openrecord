@@ -333,6 +333,27 @@ describe('startHttpServer', () => {
     expect(next).not.toBe(sessionId);
   });
 
+  it('does not evict an idle session when the body is not initialize', async () => {
+    listening = await startHttpServer({ token: TOKEN, port: 0, createServer: bareServer, idleMs: 60_000, maxSessions: 1 });
+    const url = `http://127.0.0.1:${listening.port}/mcp`;
+    const sessionId = await initialize(url);
+    const headers = { ...mcpHeaders, 'mcp-session-id': sessionId, 'mcp-protocol-version': '2025-06-18' };
+    const junk = await fetch(url, { method: 'POST', headers: mcpHeaders, body: '{not json' });
+    expect(junk.status).toBe(400);
+    const other = await fetch(url, {
+      method: 'POST',
+      headers: mcpHeaders,
+      body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'ping' }),
+    });
+    expect(other.status).toBe(400);
+    const ping = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'ping' }),
+    });
+    expect(ping.status).toBe(200);
+  });
+
   it('counts an initialize against the cap before the session is registered', async () => {
     listening = await startHttpServer({ token: TOKEN, port: 0, createServer: bareServer, idleMs: 60_000, maxSessions: 1 });
     const url = `http://127.0.0.1:${listening.port}/mcp`;

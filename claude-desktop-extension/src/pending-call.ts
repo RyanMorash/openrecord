@@ -8,8 +8,15 @@
  * Desktop's client log (~/Library/Logs/Claude/mcp.log): a `notifications/
  * cancelled` with "MCP error -32001: Request timed out" 197 s after the
  * request (June 2026 build, on `initialize`); four minutes is the figure
- * usually quoted. DEADLINE_MS sits under both and above the scrapers'
+ * usually quoted. The desktop deadline sits under both and above the scrapers'
  * 2-minute per-request deadline (scrapers/http.ts).
+ *
+ * HTTP mode uses a shorter deadline. A proxy in front of the container often
+ * closes a response around 100 seconds. A call that finished in that gap used
+ * to take the direct-return branch and never enter this map, and a collection
+ * that waited the full desktop deadline could discard a result onto a
+ * connection the proxy had already closed. One minute is inside that window
+ * for both the park note and a collection wait. Desktop is unchanged.
  *
  * Calls are not serialized — the same log shows Claude Desktop issuing a
  * second call 5.5 s after an unanswered first — so several may park. A
@@ -27,8 +34,30 @@ import { randomUUID } from 'crypto';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
 export const CHECK_TOOL = 'check_pending_call';
-const DEADLINE_MS = 150_000;
-export const DEADLINE_LABEL = '2.5 minutes';
+const DESKTOP_DEADLINE_MS = 150_000;
+const DESKTOP_DEADLINE_LABEL = '2.5 minutes';
+/** Under the ~100s proxy cutoff in front of the container. See the file comment. */
+const HTTP_DEADLINE_MS = 60_000;
+const HTTP_DEADLINE_LABEL = '1 minute';
+
+let parkDeadlineMs = DESKTOP_DEADLINE_MS;
+let parkDeadlineLabel = DESKTOP_DEADLINE_LABEL;
+
+/** What the parking note and `check_pending_call`'s description currently say. Read at registration, so call it when registering, not at import. */
+export function currentParkDeadlineLabel(): string {
+  return parkDeadlineLabel;
+}
+
+/** `--http` only. Stdio keeps the desktop deadline. `ms` is the test seam; production passes none. */
+export function useHttpParkDeadline(ms = HTTP_DEADLINE_MS): void {
+  parkDeadlineMs = ms;
+  parkDeadlineLabel = HTTP_DEADLINE_LABEL;
+}
+
+export function useDesktopParkDeadline(): void {
+  parkDeadlineMs = DESKTOP_DEADLINE_MS;
+  parkDeadlineLabel = DESKTOP_DEADLINE_LABEL;
+}
 /** From a call's start, after which it is dropped: result given up on, chart lock released. Also how long an unread result is kept. */
 export const MAX_RUN_MS = 10 * 60_000;
 
@@ -147,7 +176,7 @@ export async function runGuarded(
   tool: string,
   args: Record<string, unknown>,
   fn: () => CallToolResult | Promise<CallToolResult>,
-  deadlineMs = DEADLINE_MS,
+  deadlineMs = parkDeadlineMs,
 ): Promise<CallToolResult> {
   const now = Date.now();
   sweep(now);
@@ -172,7 +201,7 @@ export async function runGuarded(
     entry.settledAt = Date.now();
   });
   return stillRunning(
-    `${tool} (id "${entry.id}") is still running after ${DEADLINE_LABEL} and keeps running in the background for up ` +
+    `${tool} (id "${entry.id}") is still running after ${parkDeadlineLabel} and keeps running in the background for up ` +
       `to 10 minutes. Call ${CHECK_TOOL} with that id to wait for and read its result. Do NOT call ${tool} again ` +
       'with the same arguments; it would be refused. Other tools are unaffected.',
     entry.id,
@@ -189,7 +218,7 @@ export function unsettledCallOnAccount(account: string): { tool: string; id: str
 /** The `check_pending_call` handler. `deadlineMs` is the test seam. */
 export async function checkPendingCall(
   { id, wait, abandon }: { id?: string; wait?: boolean; abandon?: boolean },
-  deadlineMs = DEADLINE_MS,
+  deadlineMs = parkDeadlineMs,
 ): Promise<CallToolResult> {
   const now = Date.now();
   sweep(now);

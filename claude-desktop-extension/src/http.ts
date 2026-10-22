@@ -26,6 +26,9 @@ import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 export const HTTP_PORT = 8787;
 
 const MCP_PATH = '/mcp';
+/** A client that exits without DELETE must not keep a transport for the life of the container. */
+const SESSION_IDLE_MS = 30 * 60_000;
+const MAX_SESSIONS = 8;
 
 export interface HttpServer {
   port: number;
@@ -34,6 +37,9 @@ export interface HttpServer {
 
 interface Session {
   transport: StreamableHTTPServerTransport;
+  lastUsed: number;
+  /** A request currently inside handleRequest. Idle expiry skips these so a reconnect can still use the session. */
+  inflight: number;
 }
 
 /**
@@ -65,8 +71,13 @@ export function startHttpServer(options: {
   token: string;
   port: number;
   createServer: () => McpServer;
+  /** Test seams. Production leaves both unset. */
+  idleMs?: number;
+  maxSessions?: number;
 }): Promise<HttpServer> {
   const { token, port, createServer: newMcpServer } = options;
+  const idleMs = options.idleMs ?? SESSION_IDLE_MS;
+  const maxSessions = options.maxSessions ?? MAX_SESSIONS;
   if (token.length === 0) {
     return Promise.reject(new Error('OPENRECORD_MCP_TOKEN is required for --http'));
   }
@@ -74,12 +85,40 @@ export function startHttpServer(options: {
   const sessions = new Map<string, Session>();
   let closed = false;
 
+  function drop(session: Session): void {
+    const id = session.transport.sessionId;
+    if (id) sessions.delete(id);
+    void session.transport.close();
+  }
+
+  function expireIdle(now = Date.now()): void {
+    for (const session of [...sessions.values()]) {
+      if (session.inflight === 0 && now - session.lastUsed >= idleMs) drop(session);
+    }
+  }
+
+  /** Close the oldest idle session until a new one fits. False when every slot is mid-request. */
+  function makeRoom(): boolean {
+    expireIdle();
+    while (sessions.size >= maxSessions) {
+      const idle = [...sessions.values()].filter((session) => session.inflight === 0).sort((a, b) => a.lastUsed - b.lastUsed);
+      const victim = idle[0];
+      if (!victim) return false;
+      drop(victim);
+    }
+    return true;
+  }
+
   async function openSession(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (!makeRoom()) {
+      jsonError(req, res, 503, 'Too many MCP sessions');
+      return;
+    }
     const mcp = newMcpServer();
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => randomUUID(),
       onsessioninitialized: (sessionId) => {
-        sessions.set(sessionId, { transport });
+        sessions.set(sessionId, { transport, lastUsed: Date.now(), inflight: 1 });
       },
     });
     // Set before connect(): the protocol wraps whatever onclose is already there.
@@ -94,8 +133,15 @@ export function startHttpServer(options: {
       await mcp.connect(transport as Transport);
       await transport.handleRequest(req, res);
     } finally {
-      // A POST that was not initialize never joins the map. Drop it.
-      if (!transport.sessionId) await transport.close();
+      const id = transport.sessionId;
+      const session = id ? sessions.get(id) : undefined;
+      if (!session) {
+        // A POST that was not initialize never joins the map.
+        await transport.close();
+      } else {
+        session.inflight -= 1;
+        session.lastUsed = Date.now();
+      }
     }
   }
 
@@ -116,6 +162,7 @@ export function startHttpServer(options: {
       return;
     }
 
+    expireIdle();
     const sessionHeader = req.headers['mcp-session-id'];
     const sessionId = typeof sessionHeader === 'string' ? sessionHeader : undefined;
     if (method === 'POST' && !sessionId) {
@@ -128,7 +175,14 @@ export function startHttpServer(options: {
       jsonError(req, res, sessionId ? 404 : 400, sessionId ? 'Session not found' : 'Mcp-Session-Id header is required');
       return;
     }
-    await existing.transport.handleRequest(req, res);
+    existing.inflight += 1;
+    existing.lastUsed = Date.now();
+    try {
+      await existing.transport.handleRequest(req, res);
+    } finally {
+      existing.inflight -= 1;
+      existing.lastUsed = Date.now();
+    }
   }
 
   const httpServer = createServer((req, res) => {
@@ -137,11 +191,17 @@ export function startHttpServer(options: {
       if (!res.headersSent) endEmpty(req, res, 500);
     });
   });
+  const idleTimer = setInterval(() => expireIdle(), Math.min(idleMs, 60_000));
+  idleTimer.unref?.();
 
   return new Promise((resolve, reject) => {
-    httpServer.once('error', reject);
+    const onListenError = (err: Error): void => {
+      clearInterval(idleTimer);
+      reject(err);
+    };
+    httpServer.once('error', onListenError);
     httpServer.listen(port, '0.0.0.0', () => {
-      httpServer.off('error', reject);
+      httpServer.off('error', onListenError);
       const address = httpServer.address();
       const bound = typeof address === 'object' && address ? address.port : port;
       process.stderr.write(`[openrecord] listening on http://0.0.0.0:${bound}/mcp\n`);
@@ -150,6 +210,7 @@ export function startHttpServer(options: {
         async close() {
           if (closed) return;
           closed = true;
+          clearInterval(idleTimer);
           const open = [...sessions.values()];
           sessions.clear();
           await Promise.all(open.map((session) => session.transport.close()));

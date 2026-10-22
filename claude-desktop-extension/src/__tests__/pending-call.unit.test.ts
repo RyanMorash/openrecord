@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, setSystemTime } from 'bun:
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { CAPABILITIES } from '../../../shared/capabilities';
-import { CHECK_TOOL, MAX_RUN_MS, checkPendingCall, resetPendingCalls, runGuarded, unsettledCallOnAccount } from '../pending-call';
+import { CHECK_TOOL, MAX_RUN_MS, checkPendingCall, resetPendingCalls, runGuarded, unsettledCallOnAccount, useDesktopParkDeadline, useHttpParkDeadline } from '../pending-call';
 
 const ok = (text: string): CallToolResult => ({ content: [{ type: 'text', text }] });
 const text = (r: CallToolResult): string => (r.content[0] as { text: string }).text;
@@ -27,7 +27,10 @@ function deferred() {
 }
 const ACCOUNT = { account: 'homer@mychart.example.org' };
 
-beforeEach(() => resetPendingCalls());
+beforeEach(() => {
+  resetPendingCalls();
+  useDesktopParkDeadline();
+});
 afterEach(() => setSystemTime());
 
 describe('runGuarded', () => {
@@ -187,6 +190,26 @@ describe('checkPendingCall', () => {
     expect([r.isError, text(r)]).toEqual([true, expect.stringContaining('Gave up on get_billing')]);
     expect(await runGuarded('get_billing', ACCOUNT, () => ok('fresh'), 50)).toEqual(ok('fresh'));
     d.resolve(ok('bills'));
+  });
+});
+
+describe('http park deadline', () => {
+  it('parks inside the proxy window and keeps a result the timed-out collection did not return', async () => {
+    useHttpParkDeadline(30);
+    const d = deferred();
+    const started = Date.now();
+    const parked = await runGuarded('get_profile', ACCOUNT, d.fn);
+    const id = idOf(parked);
+    expect(Date.now() - started).toBeLessThan(500);
+    expect(text(parked)).toContain('is still running after 1 minute');
+
+    // The collection wait is the same short deadline. Nothing is ready, so the
+    // entry stays: a later call still receives the result.
+    expect(text(await checkPendingCall({ id }))).toContain('is still running');
+
+    d.resolve(ok('profile'));
+    await tick();
+    expect(await checkPendingCall({ id })).toEqual(ok('profile'));
   });
 });
 

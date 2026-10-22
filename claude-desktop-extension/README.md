@@ -288,6 +288,11 @@ export OPENRECORD_MCP_TOKEN="$(openssl rand -hex 32)"
 docker compose up --build -d
 ```
 
+Compose publishes `8787` on `127.0.0.1` only. A Cloudflare Tunnel or reverse
+proxy on that machine is how the portal reaches it. The process inside the
+container still listens on all of its interfaces, which is what the publish
+line connects to.
+
 `OPENRECORD_MCP_TOKEN` is required. The process refuses to listen without it,
 and every `/mcp` request must send `Authorization: Bearer <token>`. A missing
 or wrong token is an empty `401` with no `WWW-Authenticate` header, so the
@@ -336,8 +341,12 @@ A client that cannot complete Access OAuth on its own can use the `mcp-remote`
 command Cloudflare documents for portal config files.
 
 A proxy in front of the container often closes a response around 100 seconds.
-A scrape that outruns that keeps running. The HTTP server's instructions tell
-the model to call `check_pending_call` and not to repeat the original tool.
+HTTP mode parks a call after 1 minute, and `check_pending_call` waits at most
+1 minute, so the park note and a collection answer are both written before that
+cutoff. A result that is not ready yet stays parked. An MCP session that has
+been idle for 30 minutes is dropped, and the process keeps at most 8 sessions,
+so a client that reconnects without ending the old one does not accumulate
+transports. A session with a request in flight is kept.
 
 This path is not the desktop privacy story below. Tool results pass through
 Cloudflare and the MCP client (Cursor or xAI), not only through Anthropic.
@@ -349,17 +358,20 @@ the policy covering this extension, and the URL the manifest's `privacy_policies
 
 The short version, for what this extension does:
 
-- **Your records stay on your machine.** The extension signs in to your portal
-  from your computer and keeps everything it reads there — credentials and
-  passkeys in the OS keystore, sessions under `~/.openrecord-mcpb/` (see
-  [Architecture](#architecture)), and any imaging study you ask to save as
-  JPEGs in your Downloads folder. Fan Pier Labs runs no server that holds your medical
-  record, and there is no OpenRecord account containing a copy of it.
+- **When you use Claude Desktop, your records stay on your machine.** The
+  extension signs in to your portal from your computer and keeps everything it
+  reads there — credentials and passkeys in the OS keystore, sessions under
+  `~/.openrecord-mcpb/` (see [Architecture](#architecture)), and any imaging
+  study you ask to save as JPEGs in your Downloads folder. Fan Pier Labs runs no
+  server that holds your medical record, and there is no OpenRecord account
+  containing a copy of it. The [Docker deployment](#remote-access) keeps those
+  credentials, sessions, and saved files in the `/data` volume on the host that
+  runs the container.
 - **Your chart reaches Anthropic, and nobody else.** Whatever Claude reads
   through these tools goes to Anthropic under your own Claude account, governed
   by Anthropic's terms and privacy policy. Nothing passes through Fan Pier Labs.
-  The [Docker deployment](#remote-access) is the exception: those tool results
-  also pass through Cloudflare and the MCP client.
+  The Docker deployment is the exception: those tool results also pass through
+  Cloudflare and the MCP client.
 - **Anonymous usage events.** Startup and login events carry a random
   per-install id, the MyChart hostname being signed in to, and OS/runtime
   versions — never your username, password, or anything from your record.

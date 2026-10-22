@@ -91,7 +91,7 @@ import {
   normalizeHostname,
 } from './credential-store';
 import { addPending, takePending } from './pending-logins';
-import { CHECK_TOOL, DEADLINE_LABEL, checkPendingCall, runGuarded, unsettledCallOnAccount } from './pending-call';
+import { CHECK_TOOL, checkPendingCall, currentParkDeadlineLabel, runGuarded, unsettledCallOnAccount } from './pending-call';
 import { releaseImportedCandidate, scanBrowserPasswords, takeImportedCandidate } from './browser-import';
 import { decodeStudy, encodeFullResolutionJpegs, type DecodedStudy } from './imaging/download-study';
 import { inlinePreviews } from './imaging/inline-preview';
@@ -625,10 +625,10 @@ function registerCheckPendingCall(server: McpServer): void {
     CHECK_TOOL,
     {
       description:
-        `Collect the result of a tool call that ran past ${DEADLINE_LABEL} and was parked under an id, exactly as ` +
+        `Collect the result of a tool call that ran past ${currentParkDeadlineLabel()} and was parked under an id, exactly as ` +
         'the original tool would have returned it. A result that is ready is always handed over, and handed ' +
         'over once — including under `wait: false`, so this is a collection, never a peek. When the call is ' +
-        `still running it waits up to ${DEADLINE_LABEL} for it, or with \`wait: false\` says so at once. Omit ` +
+        `still running it waits up to ${currentParkDeadlineLabel()} for it, or with \`wait: false\` says so at once. Omit ` +
         '`id` to list every pending call, which is what a refusal naming an id is talking about. `abandon: ' +
         'true` stops waiting and discards the result — it does not stop the work, and anything already sent ' +
         'still lands, so an abandoned call is still waitable here until its read finishes. Two clocks: a call ' +
@@ -640,7 +640,7 @@ function registerCheckPendingCall(server: McpServer): void {
           .boolean()
           .optional()
           .describe(
-            `Wait up to ${DEADLINE_LABEL} for the call to finish (default true). false reports at once instead — ` +
+            `Wait up to ${currentParkDeadlineLabel()} for the call to finish (default true). false reports at once instead — ` +
               'but a result that is already ready is handed over, and consumed, either way.',
           ),
         abandon: z.boolean().optional().describe('Stop waiting and discard the result. Does not stop the work.'),

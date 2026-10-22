@@ -37,6 +37,7 @@ import setupWidget from 'virtual:setup-widget';
 import { buildSetupUiHtml, SETUP_UI_MIME_TYPE, SETUP_UI_RESOURCE_META } from './ui';
 import { startDirectoryRefresh } from './directory-refresh';
 import { HTTP_PORT, startHttpServer } from './http';
+import { useHttpParkDeadline } from './pending-call';
 
 const INSTRUCTIONS =
         'OpenRecord connects this conversation to the user\'s MyChart patient portal. ' +
@@ -77,11 +78,7 @@ const INSTRUCTIONS =
         '\n  5. Use the data tools (get_medications, get_lab_results, send_message, etc.) with the ' +
         '     `account` from the previous step.' +
         '\n\n' +
-        'Long tool calls: a call that has not answered after 2.5 minutes keeps running in the background ' +
-        'and returns a note carrying an id instead of its result; collect the result with ' +
-        'check_pending_call(id). Never repeat that call with the same arguments while it is pending — it ' +
-        'is already running and would be refused, and a tool that sends something would send it twice. ' +
-        'Other tools are unaffected, except switch_proxy_target on that account, which waits for the read.' +
+        'LONG_CALLS' +
         '\n\n' +
         'Public information (no account): get_hospital_info(hostname) returns what a MyChart ' +
         'instance publishes about its health system to anyone — support phone lines, the bookable ' +
@@ -89,12 +86,22 @@ const INSTRUCTIONS =
         'the hostname first. It never returns a fax number or an accepted-insurance list; MyChart ' +
         'does not publish those.';
 
-/** Appended only for `--http`. A proxy in front of the container often drops the response before the 2.5-minute park note is written. */
-const HTTP_INSTRUCTIONS =
-  '\n\n' +
-  'A dropped connection is not a failed scrape. The work keeps running after the client gives up. ' +
-  'Call check_pending_call with no id to list it, then with that id to collect the result. ' +
-  'Do not repeat the original tool call.';
+const LONG_CALLS_STDIO =
+  'Long tool calls: a call that has not answered after 2.5 minutes keeps running in the background ' +
+  'and returns a note carrying an id instead of its result; collect the result with ' +
+  'check_pending_call(id). Never repeat that call with the same arguments while it is pending — it ' +
+  'is already running and would be refused, and a tool that sends something would send it twice. ' +
+  'Other tools are unaffected, except switch_proxy_target on that account, which waits for the read.';
+
+const LONG_CALLS_HTTP =
+  'Long tool calls: a call that has not answered after 1 minute keeps running in the background ' +
+  'and returns a note carrying an id instead of its result. That note is sent inside the minute, ' +
+  'before a proxy that closes a response around 100 seconds drops the connection. Collect the result ' +
+  'with check_pending_call(id). A collection waits at most 1 minute and leaves a result that is not ' +
+  'ready yet parked, so a dropped connection does not discard it. Never repeat that call with the same ' +
+  'arguments while it is pending — it is already running and would be refused, and a tool that sends ' +
+  'something would send it twice. Other tools are unaffected, except switch_proxy_target on that ' +
+  'account, which waits for the read.';
 
 function createMcpServer(mode: 'stdio' | 'http'): McpServer {
   const server = new McpServer(
@@ -104,7 +111,7 @@ function createMcpServer(mode: 'stdio' | 'http'): McpServer {
     },
     {
       capabilities: { tools: {}, resources: {} },
-      instructions: mode === 'http' ? INSTRUCTIONS + HTTP_INSTRUCTIONS : INSTRUCTIONS,
+      instructions: INSTRUCTIONS.replace('LONG_CALLS', mode === 'http' ? LONG_CALLS_HTTP : LONG_CALLS_STDIO),
     },
   );
 
@@ -141,6 +148,7 @@ async function main(): Promise<void> {
       console.error('[openrecord] OPENRECORD_MCP_TOKEN is required for --http');
       process.exit(1);
     }
+    useHttpParkDeadline();
     const listening = await startHttpServer({
       token,
       port: HTTP_PORT,

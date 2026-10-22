@@ -5,8 +5,10 @@ services:
     build:
       context: ..
       dockerfile: claude-desktop-extension/Dockerfile
+    # Localhost only. A tunnel or proxy on this machine is what the portal
+    # reaches. Publishing on every interface would expose the raw HTTP port.
     ports:
-      - "8787:8787"
+      - "127.0.0.1:8787:8787"
     environment:
       OPENRECORD_MCP_TOKEN: ${OPENRECORD_MCP_TOKEN:?Set OPENRECORD_MCP_TOKEN}
     volumes:

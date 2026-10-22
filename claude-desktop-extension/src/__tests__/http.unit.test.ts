@@ -10,6 +10,39 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { startHttpServer, type HttpServer } from '../http';
 
 const TOKEN = 'test-token';
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+const mcpHeaders = {
+  authorization: `Bearer ${TOKEN}`,
+  'content-type': 'application/json',
+  accept: 'application/json, text/event-stream',
+};
+
+async function initialize(url: string): Promise<string> {
+  const init = await fetch(url, {
+    method: 'POST',
+    headers: mcpHeaders,
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'initialize',
+      params: {
+        protocolVersion: '2025-06-18',
+        capabilities: {},
+        clientInfo: { name: 'http-unit', version: '0.0.0' },
+      },
+    }),
+  });
+  expect(init.status).toBe(200);
+  const sessionId = init.headers.get('mcp-session-id');
+  expect(sessionId).toBeTruthy();
+  await init.text();
+  return sessionId!;
+}
 
 function bareServer(): McpServer {
   return new McpServer({ name: 'openrecord-test', version: '0.0.0' });
@@ -150,5 +183,64 @@ describe('startHttpServer', () => {
       body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} }),
     });
     expect(failed.status).toBe(500);
+  });
+
+  it('drops an idle session and keeps one that has a request in flight', async () => {
+    listening = await startHttpServer({ token: TOKEN, port: 0, createServer: bareServer, idleMs: 80, maxSessions: 2 });
+    const url = `http://127.0.0.1:${listening.port}/mcp`;
+    const sessionId = await initialize(url);
+    const headers = { ...mcpHeaders, 'mcp-session-id': sessionId, 'mcp-protocol-version': '2025-06-18' };
+
+    const stream = await fetch(url, { method: 'GET', headers: { ...headers, accept: 'text/event-stream' } });
+    expect(stream.status).toBe(200);
+    await sleep(120);
+    const during = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'ping' }),
+    });
+    expect(during.status).toBe(200);
+    await during.text();
+    await stream.body?.cancel();
+
+    await sleep(120);
+    const after = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'ping' }),
+    });
+    expect(after.status).toBe(404);
+  });
+
+  it('refuses a new session while every existing one is mid-request, then accepts one once a slot is idle', async () => {
+    listening = await startHttpServer({ token: TOKEN, port: 0, createServer: bareServer, idleMs: 60_000, maxSessions: 1 });
+    const url = `http://127.0.0.1:${listening.port}/mcp`;
+    const sessionId = await initialize(url);
+    const headers = { ...mcpHeaders, 'mcp-session-id': sessionId, 'mcp-protocol-version': '2025-06-18' };
+    const stream = await fetch(url, { method: 'GET', headers: { ...headers, accept: 'text/event-stream' } });
+    expect(stream.status).toBe(200);
+
+    const refused = await fetch(url, {
+      method: 'POST',
+      headers: mcpHeaders,
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'initialize',
+        params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'http-unit', version: '0.0.0' } },
+      }),
+    });
+    expect(refused.status).toBe(503);
+    await stream.body?.cancel();
+    await sleep(30);
+
+    const next = await initialize(url);
+    const ping = await fetch(url, {
+      method: 'POST',
+      headers: { ...mcpHeaders, 'mcp-session-id': sessionId, 'mcp-protocol-version': '2025-06-18' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 4, method: 'ping' }),
+    });
+    expect(ping.status).toBe(404);
+    expect(next).not.toBe(sessionId);
   });
 });
